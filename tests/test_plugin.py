@@ -131,3 +131,78 @@ def test_wake_names_default_to_agent_names(tmp_path):
     assert r.returncode == 0, r.stderr
     out = json.loads(r.stdout.strip().splitlines()[-1])
     assert out == {"wake": True, "other": False}
+
+
+ADDRESSED_PLUGIN = '''
+AMBIENT_ADDRESSED = "addressed_to_helper"
+SEEN = []
+
+class _Res:
+    def __init__(self, choice, probs, layer):
+        self.ok = True
+        self.choice = choice
+        self.probabilities = probs
+        self.layer = layer
+        self.errors = {}
+
+class _Classify:
+    # Laya (layers=("laya",)) is unsure; Jev answers the chosen key with no probabilities.
+    def classify_choice(self, key, state, instructions, options, question_key=None,
+                        layers=(), laya_question=None, **kw):
+        SEEN.append({"options": sorted(options), "question_key": question_key,
+                     "laya_question": laya_question, "layers": list(layers)})
+        if tuple(layers) == ("laya",):
+            return key, _Res(question_key, {question_key: 0.2, "conversation_between_people": 0.8}, "laya")
+        return key, _Res(question_key, None, "jev")
+
+classify = _Classify()
+'''
+
+
+def test_plugin_renames_the_addressee_option_key(tmp_path):
+    (tmp_path / "fake_addressed_plugin.py").write_text(ADDRESSED_PLUGIN)
+    code = (
+        "import json, gateway as g, fake_addressed_plugin as fp\n"
+        "d = g.classify_addressed_detail('state', None, name_present=True)\n"
+        "print(json.dumps({'key': g.AMBIENT_ADDRESSED, 'options': sorted(g.AMBIENT_OPTIONS),\n"
+        "  'seen': fp.SEEN, 'decision': d, 'threshold': g.AMBIENT_THRESHOLD,\n"
+        "  'laya_q': g.AMBIENT_LAYA_QUESTION}))\n"
+    )
+    r = _run(code, tmp_path, MVG_PLUGIN="fake_addressed_plugin")
+    assert r.returncode == 0, r.stderr
+    assert "is invalid" not in r.stderr
+    out = json.loads(r.stdout.strip().splitlines()[-1])
+    assert out["key"] == "addressed_to_helper"
+    assert "addressed_to_helper" in out["options"] and "addressed_to_agent" not in out["options"]
+    assert all(s["question_key"] == "addressed_to_helper" for s in out["seen"])
+    assert all("addressed_to_helper" in s["options"] for s in out["seen"])
+    assert "Choose addressed_to_helper only if" in out["laya_q"]
+    # Laya unsure, Jev chose the renamed key: engages through the Jev path.
+    assert out["decision"]["classifier"] == "laya+jev"
+    assert out["decision"]["score"] >= out["threshold"]
+
+
+def test_no_plugin_attribute_keeps_the_default_key(tmp_path):
+    code = (
+        "import json, gateway as g\n"
+        "print(json.dumps({'key': g.AMBIENT_ADDRESSED, 'options': sorted(g.AMBIENT_OPTIONS),\n"
+        "  'laya_q': g.AMBIENT_LAYA_QUESTION}))\n"
+    )
+    (tmp_path / "fake_lomin_plugin.py").write_text(FAKE_PLUGIN)
+    r = _run(code, tmp_path, MVG_PLUGIN="fake_lomin_plugin")
+    assert r.returncode == 0, r.stderr
+    assert "is invalid" not in r.stderr
+    out = json.loads(r.stdout.strip().splitlines()[-1])
+    assert out["key"] == "addressed_to_agent"
+    assert "addressed_to_agent" in out["options"]
+    assert "Choose addressed_to_agent only if" in out["laya_q"]
+
+
+def test_invalid_plugin_key_warns_and_uses_default(tmp_path):
+    (tmp_path / "fake_bad_key_plugin.py").write_text('AMBIENT_ADDRESSED = "Bad Key"\n')
+    code = "import gateway as g; print(g.AMBIENT_ADDRESSED)"
+    r = _run(code, tmp_path, MVG_PLUGIN="fake_bad_key_plugin")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip().splitlines()[-1] == "addressed_to_agent"
+    assert ("lomin: plugin AMBIENT_ADDRESSED 'Bad Key' is invalid; "
+            "using addressed_to_agent") in r.stderr

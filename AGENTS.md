@@ -39,6 +39,7 @@ Every hook is optional:
 - `brain_call_stream(target, prompt, timeout, on_partial, stages_out) -> str` — streaming brain.
 - `classify` — a module with `classify_choice(...)` (the addressee classifier).
 - `try_intent(text) -> dict | None` — deterministic fast path.
+- `AMBIENT_ADDRESSED` — a string: the option key the addressee classifier answers with (default `addressed_to_agent`).
 
 The gateway reads these as module attributes at import (`_plugin_brain_call`,
 `_plugin_brain_call_stream`, `_jev_classifier`, `_try_intent`). Tests replace

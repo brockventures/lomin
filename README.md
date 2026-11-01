@@ -29,6 +29,7 @@ MVG_BRAIN=http MVG_BRAIN_URL=http://127.0.0.1:8000/brain python3 gateway.py
 | `classify` | module with `classify_choice(...)` | addressee classifier for `/ambient` and open rooms |
 | `try_intent(text)` | `-> dict \| None` | deterministic fast path; see "Fast path" below |
 | `AMBIENT_LAYA_QUESTION`, `VOICE_ADDRESSED_INSTRUCTIONS` | `str` | replace the addressee classifier's wording, for a site whose classifier was tuned on its own text |
+| `AMBIENT_ADDRESSED` | `str` | the option key the addressee classifier answers with; default `addressed_to_agent` |
 
 Without `brain_call`, `MVG_BRAIN` defaults to `http`. A plugin that fails to import prints `lomin: plugin '<name>' failed to load (<error>); running without it` on stderr and the gateway runs without it. Site code lives in a plugin, never in this repo.
 

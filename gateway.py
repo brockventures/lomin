@@ -340,8 +340,17 @@ AMBIENT_LAYA_TIMEOUT = float(os.environ.get("MVG_AMBIENT_LAYA_TIMEOUT", "0.5"))
 # Laya P(yes) at or above this engages on its own (Jev not called); below it,
 # Jev gives the second opinion.
 AMBIENT_LAYA_CONFIDENT = float(os.environ.get("MVG_AMBIENT_LAYA_CONFIDENT", "0.7"))
+# The option key the addressee classifier answers with. A plugin may rename it
+# (a site whose classifier models were built on its own key). A value that is
+# not a lowercase identifier is refused on stderr and the default is used.
+AMBIENT_ADDRESSED = getattr(_plugin, "AMBIENT_ADDRESSED", None) or "addressed_to_agent"
+if not (isinstance(AMBIENT_ADDRESSED, str)
+        and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", AMBIENT_ADDRESSED)):
+    print(f"lomin: plugin AMBIENT_ADDRESSED '{AMBIENT_ADDRESSED}' is invalid; "
+          "using addressed_to_agent", file=sys.stderr)
+    AMBIENT_ADDRESSED = "addressed_to_agent"
 AMBIENT_LAYA_QUESTION = (
-    "Who is the LAST line addressed to? Choose addressed_to_agent only if "
+    f"Who is the LAST line addressed to? Choose {AMBIENT_ADDRESSED} only if "
     f"the speaker names {AGENT_NAME}, the AI assistant, or is directly "
     f"following up on {AGENT_NAME}'s own reply just above it. People talking to "
     "each other (even questions, even \"you\") are "
@@ -350,9 +359,8 @@ AMBIENT_LAYA_QUESTION = (
 # A plugin may supply its own wording (a site whose classifier was tuned on it).
 AMBIENT_LAYA_QUESTION = getattr(_plugin, "AMBIENT_LAYA_QUESTION", None) or AMBIENT_LAYA_QUESTION
 # MÁHANAXAR stage 4: the addressed-to-agent yes/no is a choice over these.
-# Engagement is decided on P(addressed_to_agent) against AMBIENT_THRESHOLD /
+# Engagement is decided on P(addressed) against AMBIENT_THRESHOLD /
 # AMBIENT_LAYA_CONFIDENT, exactly the old cuts.
-AMBIENT_ADDRESSED = "addressed_to_agent"
 AMBIENT_OPTIONS = {
     AMBIENT_ADDRESSED: f"the LAST utterance is a request or question for {AGENT_NAME} to act on or answer",
     "conversation_between_people": f"people in the room are talking to each other, not to {AGENT_NAME}",
