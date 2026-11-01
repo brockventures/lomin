@@ -180,7 +180,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 
@@ -201,6 +201,7 @@ from vision_adpcm import (  # noqa: E402,F401
     decode_adpcm_to_wav,
     extract_vision_payloads,
 )
+from ha_fastpath import try_ha_conversation  # noqa: E402,F401
 
 # --- Plugin ------------------------------------------------------------
 # MVG_PLUGIN names an importable module that supplies household parts.
@@ -228,14 +229,46 @@ _try_intent = getattr(_plugin, "try_intent", None) or (lambda text: None)
 _NO_INTENT = {"hit": False, "intent": None, "match_ms": 0.0, "handler_ms": None, "reason": "miss"}
 
 
-def _intent(text: str) -> dict:
+def _intent(text: str, has_images: bool = False) -> dict:
     """The fast path's result in the shape the call sites read. A plugin that
     answers None, or raises, is a miss: the turn goes to the brain."""
     try:
         res = _try_intent(text)
     except Exception as exc:  # a broken plugin must never lose a turn
         return {**_NO_INTENT, "reason": f"intent_error:{type(exc).__name__}"}
-    return res if res is not None else dict(_NO_INTENT)
+    if res is not None:
+        return res
+
+    ha_enabled = bool(HA_ENABLED) or (os.environ.get("MVG_HA_ENABLED", "0") == "1")
+    if ha_enabled:
+        t0 = time.time()
+        try:
+            matched, speech, meta = try_ha_conversation(text, has_images=has_images)
+            elapsed_ms = round((time.time() - t0) * 1000, 2)
+            if matched:
+                return {
+                    "hit": True,
+                    "intent": "ha_conversation",
+                    "reply": speech,
+                    "match_ms": elapsed_ms,
+                    "handler_ms": elapsed_ms,
+                    "reason": meta.get("reason", "action_done"),
+                    "meta": meta,
+                }
+            return {
+                **_NO_INTENT,
+                "match_ms": elapsed_ms,
+                "reason": meta.get("reason", "miss"),
+            }
+        except Exception as exc:
+            elapsed_ms = round((time.time() - t0) * 1000, 2)
+            return {
+                **_NO_INTENT,
+                "match_ms": elapsed_ms,
+                "reason": f"ha_error:{type(exc).__name__}",
+            }
+
+    return dict(_NO_INTENT)
 
 # --- Paths -------------------------------------------------------------
 
@@ -266,6 +299,11 @@ ENABLE_ADPCM = os.environ.get("MVG_ENABLE_ADPCM", "0") == "1"
 # Streaming SSE HTTP brain & direct-audio flags (Chunk 2 parity)
 HTTP_BRAIN_STREAM = os.environ.get("MVG_HTTP_STREAM", "0") == "1"
 BRAIN_DIRECT_AUDIO = os.environ.get("MVG_BRAIN_DIRECT_AUDIO", "0") == "1"
+
+# Home Assistant conversation intent fast-path flags (Chunk 3 parity)
+HA_ENABLED = os.environ.get("MVG_HA_ENABLED", "0") == "1"
+HA_URL = os.environ.get("MVG_HA_URL", "")
+HA_TOKEN = os.environ.get("MVG_HA_TOKEN", "")
 
 WHISPER_URL = os.environ.get("WHISPER_URL", "http://127.0.0.1:9099/transcribe")
 WHISPER_HEALTH_URL = os.environ.get(
@@ -3120,7 +3158,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 # LAMMAS: deterministic fast path, after STT and the addressed
                 # gate, before the brain. A miss / error / slow handler falls
                 # through to the brain below, unchanged.
-                fast = opts.get("intent_result") or _intent(prompt)
+                has_vision = bool(ctx.get("image_b64") or ctx.get("burst_images_b64"))
+                fast = opts.get("intent_result") or _intent(prompt, has_images=has_vision)
                 intent_rec["intent_match_ms"] = fast["match_ms"]
                 intent_rec["intent_handler_ms"] = fast["handler_ms"]
                 if fast["hit"]:
