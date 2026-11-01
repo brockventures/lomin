@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-LÓMIN voice gateway. Gives agents a voice: STT, brain and TTS backends over
+Lomin Agent Voice Gateway. Gives agents a voice: STT, brain and TTS backends over
 plain HTTP. Site-specific parts (the brain transport, the addressee classifier,
 the fast-path intents, default env values) come from a plugin named by
 MVG_PLUGIN; see README.md, "Plugin".
-
-Extracted from the Karakos household stack (mcarmody/karakos).
 
 Binds 0.0.0.0:9098 by default. Python 3.13 stdlib only, with optional,
 guarded dependencies: /ambient's classifier is the plugin's `classify` module
@@ -340,7 +338,7 @@ AMBIENT_LAYA_TIMEOUT = float(os.environ.get("MVG_AMBIENT_LAYA_TIMEOUT", "0.5"))
 # Jev gives the second opinion.
 AMBIENT_LAYA_CONFIDENT = float(os.environ.get("MVG_AMBIENT_LAYA_CONFIDENT", "0.7"))
 AMBIENT_LAYA_QUESTION = (
-    "Who is the LAST line addressed to? Choose addressed_to_amos only if "
+    "Who is the LAST line addressed to? Choose addressed_to_agent only if "
     f"the speaker names {AGENT_NAME}, the AI assistant, or is directly "
     f"following up on {AGENT_NAME}'s own reply just above it. People talking to "
     "each other (even questions, even \"you\") are "
@@ -349,9 +347,9 @@ AMBIENT_LAYA_QUESTION = (
 # A plugin may supply its own wording (a site whose classifier was tuned on it).
 AMBIENT_LAYA_QUESTION = getattr(_plugin, "AMBIENT_LAYA_QUESTION", None) or AMBIENT_LAYA_QUESTION
 # MÁHANAXAR stage 4: the addressed-to-agent yes/no is a choice over these.
-# Engagement is decided on P(addressed_to_amos) against AMBIENT_THRESHOLD /
+# Engagement is decided on P(addressed_to_agent) against AMBIENT_THRESHOLD /
 # AMBIENT_LAYA_CONFIDENT, exactly the old cuts.
-AMBIENT_ADDRESSED = "addressed_to_amos"
+AMBIENT_ADDRESSED = "addressed_to_agent"
 AMBIENT_OPTIONS = {
     AMBIENT_ADDRESSED: f"the LAST utterance is a request or question for {AGENT_NAME} to act on or answer",
     "conversation_between_people": f"people in the room are talking to each other, not to {AGENT_NAME}",
@@ -678,9 +676,9 @@ def decide_addressed(node_id: str, transcript: str, speaker: str = "") -> dict:
 
 
 def _addressed_score(result) -> float:
-    """P(addressed_to_amos) for a choice Result: the layer's own probability
+    """P(addressed_to_agent) for a choice Result: the layer's own probability
     when it reported one, else (Haiku, which returns no probabilities) 1.0
-    for an addressed_to_amos choice and 0.0 for any other."""
+    for an addressed_to_agent choice and 0.0 for any other."""
     probs = result.probabilities
     if probs and AMBIENT_ADDRESSED in probs:
         return float(probs[AMBIENT_ADDRESSED])
@@ -694,7 +692,7 @@ def classify_addressed_detail(state: str, laya_state=None, name_present: bool = 
 
     1. Laya (own classify_choice() call, layers=("laya",), AMBIENT_LAYA_TIMEOUT,
        choice over AMBIENT_OPTIONS on the turn list `laya_state`) answers with
-       P(addressed_to_amos) >= AMBIENT_LAYA_CONFIDENT -> classifier "laya", Jev not called.
+       P(addressed_to_agent) >= AMBIENT_LAYA_CONFIDENT -> classifier "laya", Jev not called.
     2. Laya P(yes) below that -> second classify() call, layers
        ("jev", "haiku") (Haiku only on a Jev error or timeout). That score
        decides against AMBIENT_THRESHOLD, so a Jev yes overrides Laya's no.
@@ -732,13 +730,13 @@ def classify_addressed_detail(state: str, laya_state=None, name_present: bool = 
             state,
             VOICE_ADDRESSED_INSTRUCTIONS,
             AMBIENT_OPTIONS,
-            question_key="addressed_to_amos",
+            question_key=AMBIENT_ADDRESSED,
             layers=("laya",),
             laya_state=laya_state,
             laya_question=AMBIENT_LAYA_QUESTION,
             laya_timeout=AMBIENT_LAYA_TIMEOUT,
         )
-        # Laya must report P(addressed_to_amos) itself; a bare choice with no
+        # Laya must report P(addressed_to_agent) itself; a bare choice with no
         # probabilities is treated as "Laya gave no usable score" (falls to Jev).
         if lres.ok and lres.probabilities and AMBIENT_ADDRESSED in lres.probabilities:
             laya_p = float(lres.probabilities[AMBIENT_ADDRESSED])
@@ -753,7 +751,7 @@ def classify_addressed_detail(state: str, laya_state=None, name_present: bool = 
             state,
             VOICE_ADDRESSED_INSTRUCTIONS,
             AMBIENT_OPTIONS,
-            question_key="addressed_to_amos",
+            question_key=AMBIENT_ADDRESSED,
             layers=("jev", "haiku"),
             timeout=AMBIENT_JEV_TIMEOUT,
             haiku_timeout=AMBIENT_HAIKU_TIMEOUT,

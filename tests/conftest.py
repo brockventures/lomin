@@ -6,9 +6,9 @@ import pytest
 
 # The name env vars the gateway reads at import. The test suite runs with the
 # same names the old hard-coded list had; test_plugin.py covers the empty default.
-os.environ.setdefault("MVG_AGENT_NAMES", "Amos,Ammos,Amus,Famous,Almost")
-os.environ.setdefault("MVG_WAKE_NAMES", "Amos,Ammos,Amus")
-os.environ.setdefault("MVG_AGENT_NAME", "Amos")
+os.environ.setdefault("MVG_AGENT_NAMES", "Lomin,Lommin,Lowmin,Lemon,Loaming")
+os.environ.setdefault("MVG_WAKE_NAMES", "Lomin,Lommin,Lowmin")
+os.environ.setdefault("MVG_AGENT_NAME", "Lomin")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import gateway  # noqa: E402

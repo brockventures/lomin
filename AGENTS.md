@@ -1,8 +1,8 @@
-# AGENTS.md — LÓMIN
+# AGENTS.md — Lomin Agent Voice Gateway
 
 ## What this is
 
-LÓMIN is a voice gateway that gives agents a voice. It is a single Python 3.13
+Lomin Agent Voice Gateway is a voice gateway that gives agents a voice. It is a single Python 3.13
 stdlib HTTP service (`gateway.py`) that fronts speech-to-text (Whisper), a
 brain (an agent that answers one framed prompt) and text-to-speech (a chain of
 backends). It handles speech gating, speaker identification, addressee

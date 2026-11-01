@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Echo filter: a transcript that repeats Amos's last reply is dropped.
+"""Echo filter: a transcript that repeats Lomin's last reply is dropped.
 
 Run: python3 -m pytest tests/test_reply_echo.py -v
 """

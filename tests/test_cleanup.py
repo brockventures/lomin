@@ -52,7 +52,7 @@ def test_no_classifier_decide_addressed_engages_on_name(monkeypatch):
     mid-utterance engages (name-only), and the same utterance without a name
     does not. Uses a fresh node id so no earlier turn is open."""
     monkeypatch.setattr(gateway, "_jev_classifier", None)
-    named = gateway.decide_addressed("p1b-no-classifier", "turn on the kitchen lights, Amos")
+    named = gateway.decide_addressed("p1b-no-classifier", "turn on the kitchen lights, Lomin")
     assert named["classifier"] == "name-only"
     assert named["score"] == 1.0
     assert gateway.AMBIENT_THRESHOLD <= named["score"]

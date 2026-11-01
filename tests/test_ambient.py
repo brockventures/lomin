@@ -69,20 +69,20 @@ def _speech_gate_unavailable_by_default(monkeypatch):
 
 
 def _patch_jev(monkeypatch, fn):
-    """fn(state, timeout=None) -> (P(addressed_to_amos)|None, error), patched
+    """fn(state, timeout=None) -> (P(addressed_to_agent)|None, error), patched
     in at classify.jev_choice_once so the real classify() runs around it. The
-    score becomes a Jev choice answer: addressed_to_amos when it is the
+    score becomes a Jev choice answer: addressed_to_agent when it is the
     larger of the two probabilities, else conversation_between_people."""
     if _cl is None:
         pytest.skip("needs the household classifier module (plugin 'classify')")
     def fake_jev_choice_once(key, state, question_key, instructions, options, timeout):
-        assert question_key == "addressed_to_amos"
+        assert question_key == "addressed_to_agent"
         assert set(options) == set(gateway.AMBIENT_OPTIONS)
         score, err = fn(state, timeout)
         if score is None:
             return None, err, True, None, {}
-        choice = "addressed_to_amos" if score >= 0.5 else "conversation_between_people"
-        probs = {"addressed_to_amos": score, "conversation_between_people": 1 - score}
+        choice = "addressed_to_agent" if score >= 0.5 else "conversation_between_people"
+        probs = {"addressed_to_agent": score, "conversation_between_people": 1 - score}
         return choice, "", True, None, {"probabilities": probs,
                                         "confidence": max(probs.values())}
     monkeypatch.setattr(_cl, "jev_choice_once", fake_jev_choice_once)
@@ -91,7 +91,7 @@ def _patch_jev(monkeypatch, fn):
 def _patch_haiku(monkeypatch, fn):
     """fn(state, timeout=None) -> (score|None, error), patched in at
     classify.haiku_choice (the layer's `claude -p` hop). Haiku returns a
-    choice only: score >= 0.6 means addressed_to_amos, else
+    choice only: score >= 0.6 means addressed_to_agent, else
     conversation_between_people."""
     if _cl is None:
         pytest.skip("needs the household classifier module (plugin 'classify')")
@@ -99,14 +99,14 @@ def _patch_haiku(monkeypatch, fn):
         score, err = fn(state, timeout)
         if score is None:
             return None, err
-        return ("addressed_to_amos" if score >= 0.6
+        return ("addressed_to_agent" if score >= 0.6
                 else "conversation_between_people"), "stub"
     monkeypatch.setattr(_cl, "haiku_choice", fake_haiku)
 
 
 class _FakeWhisperHandler(BaseHTTPRequestHandler):
     received_bodies = []
-    next_text = "hello Amos"
+    next_text = "hello Lomin"
 
     def log_message(self, *_):
         pass
@@ -134,7 +134,7 @@ class _FakeWhisperHandler(BaseHTTPRequestHandler):
 @pytest.fixture()
 def fake_whisper(monkeypatch):
     _FakeWhisperHandler.received_bodies = []
-    _FakeWhisperHandler.next_text = "hello Amos"
+    _FakeWhisperHandler.next_text = "hello Lomin"
     server = HTTPServer(("127.0.0.1", 0), _FakeWhisperHandler)
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -285,7 +285,7 @@ def test_is_hallucination_or_too_short():
     assert gateway.is_hallucination_or_too_short("Thanks for watching")
     assert gateway.is_hallucination_or_too_short("")
     assert gateway.is_hallucination_or_too_short("a")
-    assert not gateway.is_hallucination_or_too_short("Amos?")
+    assert not gateway.is_hallucination_or_too_short("Lomin?")
     assert not gateway.is_hallucination_or_too_short("what's the weather")
 
 
@@ -307,14 +307,14 @@ def test_ambient_skips_classification_on_hallucination(gateway_server, fake_whis
 
 @needs_classify
 def test_ambient_engage_by_name(gateway_server, fake_whisper, monkeypatch):
-    _FakeWhisperHandler.next_text = "what's the weather tomorrow, Amos"
+    _FakeWhisperHandler.next_text = "what's the weather tomorrow, Lomin"
     _patch_jev(monkeypatch, lambda state, timeout=None: (0.95, ""))
     status, data = _post_ambient(gateway_server, b"RIFFdata", "node-1")
     assert status == 200
     assert data["engage"] is True
     assert data["classifier"] == "jev"
     assert data["score"] == 0.95
-    assert data["transcript"] == "what's the weather tomorrow, Amos"
+    assert data["transcript"] == "what's the weather tomorrow, Lomin"
     assert "stt" in data["ms"] and "classify" in data["ms"]
 
 
@@ -403,7 +403,7 @@ def test_ask_stream_reply_opens_ambient_followup_window(gateway_server, fake_whi
     """Parity with test_ask_reply_opens_ambient_followup_window above:
     /ask/stream is a second path to a real answer and must open the same
     follow-up window /ask does (gateway.py's own docstring: "the timestamp
-    of Amos's last /ask reply on that node" — /ask/stream is included)."""
+    of Lomin's last /ask reply on that node" — /ask/stream is included)."""
     _do_ask_stream(gateway_server, "what's the weather today", "node-1", monkeypatch, "It's sunny today.")
 
     seen_state = {}
@@ -489,7 +489,7 @@ def test_ambient_followup_outside_window_does_not_force_engage(gateway_server, f
 
 @needs_classify
 def test_ambient_no_engage_on_mention_to_someone_else(gateway_server, fake_whisper, monkeypatch):
-    _FakeWhisperHandler.next_text = "I told Amos about it yesterday"
+    _FakeWhisperHandler.next_text = "I told Lomin about it yesterday"
     _patch_jev(monkeypatch, lambda state, timeout=None: (0.1, ""))
     status, data = _post_ambient(gateway_server, b"RIFFdata", "node-1")
     assert data["engage"] is False
@@ -504,7 +504,7 @@ def test_ambient_no_engage_on_mention_to_someone_else(gateway_server, fake_whisp
 def test_ambient_falls_back_to_haiku_on_jev_error(gateway_server, fake_whisper, monkeypatch):
     _patch_jev(monkeypatch, lambda state, timeout=None: (None, "http 503"))
     _patch_haiku(monkeypatch, lambda state, timeout=None: (0.8, ""))
-    _FakeWhisperHandler.next_text = "Amos turn off the lights"
+    _FakeWhisperHandler.next_text = "Lomin turn off the lights"
     status, data = _post_ambient(gateway_server, b"RIFFdata", "node-1")
     assert data["engage"] is True
     assert data["classifier"] == "haiku"
@@ -533,7 +533,7 @@ def test_ambient_low_jev_score_never_calls_haiku(gateway_server, fake_whisper, m
 def test_ambient_both_classifiers_fail_does_not_engage(gateway_server, fake_whisper, monkeypatch):
     _patch_jev(monkeypatch, lambda state, timeout=None: (None, "timeout"))
     _patch_haiku(monkeypatch, lambda state, timeout=None: (None, "connection refused"))
-    _FakeWhisperHandler.next_text = "Amos what's up"
+    _FakeWhisperHandler.next_text = "Lomin what's up"
     status, data = _post_ambient(gateway_server, b"RIFFdata", "node-1")
     assert status == 200
     assert data["engage"] is False
@@ -547,7 +547,7 @@ def test_ambient_both_classifiers_fail_does_not_engage(gateway_server, fake_whis
 @needs_classify
 def test_ambient_multipart_node_id(gateway_server, fake_whisper, monkeypatch):
     _patch_jev(monkeypatch, lambda state, timeout=None: (0.95, ""))
-    _FakeWhisperHandler.next_text = "hey Amos"
+    _FakeWhisperHandler.next_text = "hey Lomin"
     boundary = "----WebKitFormBoundaryXYZ"
     body = _build_multipart_ambient(boundary, b"RIFFdata", "node-mp")
     conn = http.client.HTTPConnection("127.0.0.1", gateway_server, timeout=10)
@@ -561,7 +561,7 @@ def test_ambient_multipart_node_id(gateway_server, fake_whisper, monkeypatch):
     assert data["engage"] is True
     # context recorded under the right node, labeled "unknown" (no speakers
     # configured by default — see _no_speakers_file_by_default)
-    assert gateway._ambient_context_lines("node-mp") == ["unknown: hey Amos"]
+    assert gateway._ambient_context_lines("node-mp") == ["unknown: hey Lomin"]
 
 
 # --------------------------------------------------------------------------
@@ -571,7 +571,7 @@ def test_ambient_multipart_node_id(gateway_server, fake_whisper, monkeypatch):
 @needs_classify
 def test_stt_cache_hit_after_ambient_engage(gateway_server, fake_whisper, monkeypatch):
     _patch_jev(monkeypatch, lambda state, timeout=None: (0.95, ""))
-    _FakeWhisperHandler.next_text = "Amos set a timer"
+    _FakeWhisperHandler.next_text = "Lomin set a timer"
     wav_bytes = b"RIFF" + b"same audio bytes" * 10
     status, data = _post_ambient(gateway_server, wav_bytes, "node-1")
     assert data["engage"] is True
@@ -582,7 +582,7 @@ def test_stt_cache_hit_after_ambient_engage(gateway_server, fake_whisper, monkey
     resp = conn.getresponse()
     stt_data = json.loads(resp.read())
     conn.close()
-    assert stt_data["text"] == "Amos set a timer"
+    assert stt_data["text"] == "Lomin set a timer"
     # Whisper was not called a second time — served from cache.
     assert len(_FakeWhisperHandler.received_bodies) == 1
 
@@ -590,7 +590,7 @@ def test_stt_cache_hit_after_ambient_engage(gateway_server, fake_whisper, monkey
 @needs_classify
 def test_stt_cache_not_populated_when_ambient_does_not_engage(gateway_server, fake_whisper, monkeypatch):
     _patch_jev(monkeypatch, lambda state, timeout=None: (0.1, ""))
-    _FakeWhisperHandler.next_text = "I told Amos about it yesterday"
+    _FakeWhisperHandler.next_text = "I told Lomin about it yesterday"
     wav_bytes = b"RIFF" + b"other audio bytes" * 10
     status, data = _post_ambient(gateway_server, wav_bytes, "node-1")
     assert data["engage"] is False
@@ -613,7 +613,7 @@ def test_ambient_non_engaging_transcript_never_written_to_disk(gateway_server, f
     monkeypatch.setattr(gateway, "LOG_DIR", tmp_path)
     _patch_jev(monkeypatch, lambda state, timeout=None: (0.05, ""))
     secret_phrase = "XYZZY-DISTINCTIVE-SECRET-PHRASE-9182"
-    _FakeWhisperHandler.next_text = f"I mentioned Amos to {secret_phrase}"
+    _FakeWhisperHandler.next_text = f"I mentioned Lomin to {secret_phrase}"
     status, data = _post_ambient(gateway_server, b"RIFFdata", "node-1")
     assert data["engage"] is False
 
@@ -641,7 +641,7 @@ def test_ambient_engaging_transcript_also_not_logged_as_text(gateway_server, fak
     monkeypatch.setattr(gateway, "LOG_DIR", tmp_path)
     _patch_jev(monkeypatch, lambda state, timeout=None: (0.95, ""))
     secret_phrase = "QUUX-ENGAGED-SECRET-PHRASE-4477"
-    _FakeWhisperHandler.next_text = f"Amos, {secret_phrase}"
+    _FakeWhisperHandler.next_text = f"Lomin, {secret_phrase}"
     status, data = _post_ambient(gateway_server, b"RIFFdata", "node-1")
     assert data["engage"] is True
 
@@ -689,13 +689,13 @@ def test_ambient_identifies_matching_speaker(gateway_server, fake_whisper, fake_
         gateway, "SPEAKERS_PATH",
         _write_speakers(tmp_path, speakers=[{"id": "mike", "embedding": [1.0, 0.0, 0.0, 0.0]}]),
     )
-    _FakeWhisperHandler.next_text = "what's the weather, Amos"
+    _FakeWhisperHandler.next_text = "what's the weather, Lomin"
     status, data = _post_ambient(gateway_server, b"RIFFdata", "node-1")
     assert status == 200
     assert data["engage"] is True
     assert data["speaker"] == "mike"
     assert data["speaker_score"] >= gateway.SPEAKER_THRESHOLD
-    assert gateway._ambient_context_lines("node-1") == ["mike: what's the weather, Amos"]
+    assert gateway._ambient_context_lines("node-1") == ["mike: what's the weather, Lomin"]
 
 
 @needs_classify
@@ -708,12 +708,12 @@ def test_ambient_no_match_below_threshold(gateway_server, fake_whisper, fake_emb
         gateway, "SPEAKERS_PATH",
         _write_speakers(tmp_path, speakers=[{"id": "mike", "embedding": [1.0, 0.0, 0.0, 0.0]}]),
     )
-    _FakeWhisperHandler.next_text = "hey Amos"
+    _FakeWhisperHandler.next_text = "hey Lomin"
     status, data = _post_ambient(gateway_server, b"RIFFdata", "node-1")
     assert data["engage"] is True
     assert data["speaker"] == ""
     assert data["speaker_score"] == 0.0
-    assert gateway._ambient_context_lines("node-1") == ["unknown: hey Amos"]
+    assert gateway._ambient_context_lines("node-1") == ["unknown: hey Lomin"]
 
 
 @needs_classify
@@ -803,7 +803,7 @@ def test_ambient_speaker_label_never_written_to_disk(gateway_server, fake_whispe
         gateway, "SPEAKERS_PATH",
         _write_speakers(tmp_path, speakers=[{"id": "mike", "embedding": [1.0, 0.0, 0.0, 0.0]}]),
     )
-    _FakeWhisperHandler.next_text = "what's the weather, Amos"
+    _FakeWhisperHandler.next_text = "what's the weather, Lomin"
     status, data = _post_ambient(gateway_server, b"RIFFdata", "node-1")
     assert data["speaker"] == "mike"
 
@@ -851,8 +851,8 @@ def test_classify_addressed_calls_classify_with_spec_kwargs(monkeypatch):
         calls.append(dict(kw, caller=caller, state=state, question=question))
         if kw["layers"] == ("laya",):
             return _cl.Result()  # Laya down
-        return _cl.Result(choice="addressed_to_amos", layer="jev",
-                          probabilities={"addressed_to_amos": 0.9, "unclear": 0.1},
+        return _cl.Result(choice="addressed_to_agent", layer="jev",
+                          probabilities={"addressed_to_agent": 0.9, "unclear": 0.1},
                           confidence=0.9)
 
     monkeypatch.setattr(_cl, "classify", fake_classify)
@@ -865,10 +865,10 @@ def test_classify_addressed_calls_classify_with_spec_kwargs(monkeypatch):
     assert "laya_criteria" not in laya_kw  # options double as Laya criteria
     assert laya_kw["laya_timeout"] == gateway.AMBIENT_LAYA_TIMEOUT == 0.5
     assert seen["kind"] == "choice"
-    assert set(seen["options"]) == {"addressed_to_amos", "conversation_between_people",
+    assert set(seen["options"]) == {"addressed_to_agent", "conversation_between_people",
                                     "background_media", "unclear"}
     assert seen["caller"] == "lomin.ambient"
-    assert seen["question_key"] == "addressed_to_amos"
+    assert seen["question_key"] == "addressed_to_agent"
     assert seen["layers"] == ("jev", "haiku")
     assert "laya_state" not in seen
     assert seen["jev_retry"] is False
@@ -902,7 +902,7 @@ def test_jev_non_addressed_choices_stay_below_threshold(monkeypatch):
     for choice in ("background_media", "unclear", "conversation_between_people"):
         def fake(key, state, qk, instr, options, timeout, _c=choice):
             return _c, "", True, None, {
-                "probabilities": {"addressed_to_amos": 0.2, _c: 0.8}, "confidence": 0.8}
+                "probabilities": {"addressed_to_agent": 0.2, _c: 0.8}, "confidence": 0.8}
         monkeypatch.setattr(_cl, "jev_choice_once", fake)
         score, classifier, _ = gateway.classify_addressed("s")
         assert classifier == "jev" and score == 0.2 < gateway.AMBIENT_THRESHOLD
@@ -911,16 +911,16 @@ def test_jev_non_addressed_choices_stay_below_threshold(monkeypatch):
 @needs_classify
 def test_jev_choice_without_probabilities_scores_by_choice(monkeypatch):
     monkeypatch.setattr(_cl, "jev_choice_once",
-                        lambda *a, **k: ("addressed_to_amos", "", True, None, {}))
+                        lambda *a, **k: ("addressed_to_agent", "", True, None, {}))
     assert gateway.classify_addressed("s")[:2] == (1.0, "jev")
 
 
 @needs_classify
 def test_laya_choice_without_probabilities_is_ignored(monkeypatch):
-    """Laya must report P(addressed_to_amos); a bare choice cannot take the
+    """Laya must report P(addressed_to_agent); a bare choice cannot take the
     fast path, Jev decides."""
     _patch_laya(monkeypatch, lambda state, question, **kw:
-                (None, "addressed_to_amos", "", None))
+                (None, "addressed_to_agent", "", None))
     _patch_jev(monkeypatch, lambda state, timeout=None: (0.2, ""))
     d = gateway.classify_addressed_detail("s", _TURNS)
     assert (d["classifier"], d["laya_score"], d["score"]) == ("jev", None, 0.2)
@@ -936,7 +936,7 @@ def test_classify_addressed_one_usage_line_per_classify_call(monkeypatch, tmp_pa
     assert len(lines) == 2  # Laya (down) and Jev each get their own line
     last = json.loads(lines[-1])
     assert last["caller"] == "lomin.ambient"
-    assert last["kind"] == "choice" and last["choice"] == "addressed_to_amos"
+    assert last["kind"] == "choice" and last["choice"] == "addressed_to_agent"
 
 
 # --------------------------------------------------------------------------
@@ -1086,7 +1086,7 @@ def test_ambient_speech_clip_passes_gate_and_logs_it(gateway_server, fake_whispe
     monkeypatch.setattr(gateway, "_silero_get", lambda: _StubSession([0.95]))
     monkeypatch.setattr(gateway, "LOG_DIR", tmp_path)
     _patch_jev(monkeypatch, lambda state, timeout=None: (0.95, ""))
-    _FakeWhisperHandler.next_text = "Amos, what time is it"
+    _FakeWhisperHandler.next_text = "Lomin, what time is it"
     status, data = _post_ambient(gateway_server, _silence_wav(), "node-1")
     assert data["engage"] is True and data["classifier"] == "jev"
     assert "vad" in data["ms"]
@@ -1113,8 +1113,8 @@ def test_ambient_gate_unavailable_falls_through_to_whisper(gateway_server, fake_
 
 @needs_classify
 def test_ambient_jev_ok_error_fallback_and_both_fail_with_real_wav(gateway_server, fake_whisper, monkeypatch):
-    # Not a wake phrase: "hello Amos" would now short-circuit before Jev.
-    _FakeWhisperHandler.next_text = "what's the weather tomorrow, Amos"
+    # Not a wake phrase: "hello Lomin" would now short-circuit before Jev.
+    _FakeWhisperHandler.next_text = "what's the weather tomorrow, Lomin"
     wav = _silence_wav()
     _patch_jev(monkeypatch, lambda s, t=None: (0.9, ""))
     assert _post_ambient(gateway_server, wav, "n")[1]["classifier"] == "jev"
@@ -1159,7 +1159,7 @@ def _patch_laya(monkeypatch, fn):
     monkeypatch.setattr(_cl, "laya_probability", fn)
 
 
-_TURNS = [{"role": "user", "content": "mike: hi amos"}]
+_TURNS = [{"role": "user", "content": "mike: hi lomin"}]
 
 
 def _laya_p(monkeypatch, p, record=None):
@@ -1168,7 +1168,7 @@ def _laya_p(monkeypatch, p, record=None):
             record.update(state=state, question=question, **kw)
         if p is None:
             return None, None, "laya request failed: timeout", None
-        probs = {"addressed_to_amos": p, "conversation_between_people": 1 - p}
+        probs = {"addressed_to_agent": p, "conversation_between_people": 1 - p}
         choice = max(probs, key=probs.get)
         if kw.get("meta") is not None:
             kw["meta"].update({"probabilities": probs, "confidence": probs[choice]})
@@ -1296,7 +1296,7 @@ def test_ambient_turns_no_open_conversation_after_window(monkeypatch):
     gateway.record_reply("n2", "old reply")
     monkeypatch.setattr(gateway, "AMBIENT_FOLLOWUP_WINDOW_SEC", -1.0)
     turns = gateway._build_ambient_turns("n2", "hello", "")
-    # Amos's reply stays in the rolling context for the whole context window
+    # Lomin's reply stays in the rolling context for the whole context window
     # even after the follow-up window closed.
     assert [t["content"] for t in turns] == ["agent: old reply", "unknown: hello"]
     assert not gateway._conversation_open("n2")
@@ -1321,9 +1321,9 @@ def _spy_chain(monkeypatch):
 
 
 @pytest.mark.parametrize("text", [
-    "hey Amos what time is it",
-    "Hey, Amos.",
-    "okay Ammos turn on the light",
+    "hey Lomin what time is it",
+    "Hey, Lomin.",
+    "okay Lommin turn on the light",
 ])
 @needs_classify
 def test_wake_phrase_decides_without_classifier(monkeypatch, text):
@@ -1336,9 +1336,9 @@ def test_wake_phrase_decides_without_classifier(monkeypatch, text):
 
 
 @pytest.mark.parametrize("text", [
-    "hey Amos what time is it",
-    "Hey, Amos.",
-    "okay Ammos turn on the light",
+    "hey Lomin what time is it",
+    "Hey, Lomin.",
+    "okay Lommin turn on the light",
 ])
 @needs_classify
 def test_wake_phrase_engages_over_http_without_classifier(
@@ -1355,7 +1355,7 @@ def test_wake_phrase_engages_over_http_without_classifier(
 
 
 @pytest.mark.parametrize("text", [
-    "I said hey amos earlier to him",
+    "I said hey lomin earlier to him",
     "that was famous",
     "almost there",
 ])
@@ -1370,9 +1370,9 @@ def test_non_wake_phrases_take_the_normal_chain(monkeypatch, text):
 
 def test_wake_phrase_regex_boundaries():
     m = gateway.WAKE_PHRASE_RE.match
-    assert m("  ...hi AMUS, hello")
-    assert m("Hello Amos")
-    assert not m("hey famous")
-    assert not m("hey Almost")
-    assert not m("hey Amoscow")
-    assert not m("hey, there Amos")
+    assert m("  ...hi LOWMIN, hello")
+    assert m("Hello Lomin")
+    assert not m("hey lemon")
+    assert not m("hey loaming")
+    assert not m("hey Lomincow")
+    assert not m("hey, there Lomin")

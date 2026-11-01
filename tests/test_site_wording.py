@@ -32,12 +32,12 @@ def test_defaults(tmp_path):
 def test_env_overrides_and_reply_label(tmp_path):
     code = ("import gateway as g, json; g.record_reply('n1', 'hello there'); "
             "print(json.dumps([g.CLASSIFY_KEY, g.LOG_NAME, g._ambient_context_lines('n1'), g._conversation_open_note('n1')]))")
-    key, log, lines, note = json.loads(_run(code, {"MVG_AGENT_LABEL": "amos", "MVG_AGENT_NAME": "Amos",
+    key, log, lines, note = json.loads(_run(code, {"MVG_AGENT_LABEL": "lomin", "MVG_AGENT_NAME": "Lomin",
                                                    "MVG_CLASSIFY_KEY": "site.ambient", "MVG_LOG_NAME": "site.jsonl"},
                                             tmp_path))
     assert key == "site.ambient" and log == "site.jsonl"
-    assert lines and lines[-1].startswith("amos: ")
-    assert note.startswith("Amos replied on this device") and "Amos's last reply was" in note
+    assert lines and lines[-1].startswith("lomin: ")
+    assert note.startswith("Lomin replied on this device") and "Lomin's last reply was" in note
 
 
 def test_log_name_is_the_file_written(tmp_path):

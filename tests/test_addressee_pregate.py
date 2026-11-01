@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Addressee pre-gate: human-to-human chatter must never reach a classifier
 (Mike, 2026-10-03: Laya said 0.92 to "You don't think I should do that now,
-do you?" with nobody naming Amos and no conversation open).
+do you?" with nobody naming Lomin and no conversation open).
 
 Reuses test_ambient.py's fixtures and helpers. Classifier layers are mocked.
 
@@ -23,7 +23,7 @@ def _count_classify(monkeypatch, laya_p=0.95, jev_p=0.1):
 
     def fake_laya(state, question, **kw):
         calls["laya"] += 1
-        probs = {"addressed_to_amos": laya_p, "conversation_between_people": 1 - laya_p}
+        probs = {"addressed_to_agent": laya_p, "conversation_between_people": 1 - laya_p}
         choice = max(probs, key=probs.get)
         if kw.get("meta") is not None:
             kw["meta"].update({"probabilities": probs, "confidence": probs[choice]})
@@ -63,7 +63,7 @@ def test_pregate_blocks_unnamed_chatter_without_open_conversation(
 @needs_classify
 def test_pregate_named_utterance_reaches_classifiers(gateway_server, fake_whisper, monkeypatch):
     calls = _count_classify(monkeypatch, laya_p=0.95)
-    _FakeWhisperHandler.next_text = "Amos, what's the weather"
+    _FakeWhisperHandler.next_text = "Lomin, what's the weather"
     status, data = _post_ambient(gateway_server, b"RIFFdata", "node-1")
     assert data["engage"] is True
     assert data["classifier"] == "laya"
@@ -71,18 +71,18 @@ def test_pregate_named_utterance_reaches_classifiers(gateway_server, fake_whispe
 
 
 @needs_classify
-def test_pregate_whisper_variant_famous_reaches_classifiers(gateway_server, fake_whisper, monkeypatch):
+def test_pregate_whisper_variant_lemon_reaches_classifiers(gateway_server, fake_whisper, monkeypatch):
     calls = _count_classify(monkeypatch, laya_p=0.95)
-    _FakeWhisperHandler.next_text = "Famous, turn on the lights"
+    _FakeWhisperHandler.next_text = "Lemon, turn on the lights"
     status, data = _post_ambient(gateway_server, b"RIFFdata", "node-1")
     assert data["engage"] is True
     assert calls["laya"] == 1
 
 
 def test_name_variants_are_word_boundary_and_case_insensitive():
-    for ok in ("amos", "AMOS, hi", "hey Ammos", "Amus?", "famous please", "almost", "Amos's list"):
+    for ok in ("lomin", "LOMIN, hi", "hey Lommin", "Lowmin?", "lemon please", "loaming", "Lomin's list"):
         assert gateway._name_mentioned(ok), ok
-    for bad in ("Amoscow", "the famously good", "Dame Amosa", "move your desk", ""):
+    for bad in ("Lomincow", "the lemonade stand", "Dame Lomina", "move your desk", ""):
         assert not gateway._name_mentioned(bad), bad
     for v in gateway.AGENT_NAME_VARIANTS:
         assert v in gateway.VOICE_ADDRESSED_INSTRUCTIONS
@@ -122,7 +122,7 @@ def test_mention_to_another_person_goes_to_classifiers_and_jev_no_decides(
         gateway_server, fake_whisper, monkeypatch):
     # Name present: classifiers are consulted; Laya low, Jev says no.
     calls = _count_classify(monkeypatch, laya_p=0.3, jev_p=0.05)
-    _FakeWhisperHandler.next_text = "ask Amos later"
+    _FakeWhisperHandler.next_text = "ask Lomin later"
     status, data = _post_ambient(gateway_server, b"RIFFdata", "node-1")
     assert data["engage"] is False
     assert data["classifier"] == "laya+jev"
@@ -130,19 +130,19 @@ def test_mention_to_another_person_goes_to_classifiers_and_jev_no_decides(
 
 
 @needs_classify
-def test_laya_gets_the_addressing_rule_and_amos_replies_in_turns(monkeypatch):
+def test_laya_gets_the_addressing_rule_and_lomin_replies_in_turns(monkeypatch):
     gateway.record_reply("n8", "Sunny and 70.")
     gateway._record_ambient_transcript("n8", "thanks", "mike")
     seen = {}
     _laya_p(monkeypatch, 0.2, seen)
     _patch_jev(monkeypatch, lambda state, timeout=None: (0.1, ""))
-    gateway.decide_addressed("n8", "Amos, and tomorrow?", "mike")
+    gateway.decide_addressed("n8", "Lomin, and tomorrow?", "mike")
     assert "talking to each other" in seen["question"]
     contents = [t["content"] for t in seen["state"]]
-    assert contents == ["agent: Sunny and 70.", "mike: thanks", "mike: Amos, and tomorrow?"]
+    assert contents == ["agent: Sunny and 70.", "mike: thanks", "mike: Lomin, and tomorrow?"]
 
 
-def test_amos_reply_stays_in_jev_state_after_followup_window():
+def test_lomin_reply_stays_in_jev_state_after_followup_window():
     gateway.record_reply("n7", "Sunny and 70.")
     old = gateway.AMBIENT_FOLLOWUP_WINDOW_SEC + 5
     with gateway._ambient_lock:
@@ -150,7 +150,7 @@ def test_amos_reply_stays_in_jev_state_after_followup_window():
         gateway._ambient_last_reply["n7"] = (ts - old, reply)
         gateway._ambient_context["n7"][0] = (ts - old, "agent", reply)
     assert not gateway._conversation_open("n7")
-    state = gateway._build_ambient_state("n7", "Amos, thanks", "mike")
+    state = gateway._build_ambient_state("n7", "Lomin, thanks", "mike")
     assert "- agent: Sunny and 70." in state
 
 
@@ -169,8 +169,8 @@ def test_name_regexes_equal_todays_patterns(tmp_path):
         "PYTHONPATH": str(gw_dir),
         "MVG_LOG_DIR": str(tmp_path),
         "MVG_HOME": str(tmp_path),
-        "MVG_AGENT_NAMES": "Amos,Ammos,Amus,Famous,Almost",
-        "MVG_WAKE_NAMES": "Amos,Ammos,Amus",
+        "MVG_AGENT_NAMES": "Lomin,Lommin,Lowmin,Lemon,Loaming",
+        "MVG_WAKE_NAMES": "Lomin,Lommin,Lowmin",
     }
     code = (
         "import json, gateway as g\n"
@@ -181,6 +181,6 @@ def test_name_regexes_equal_todays_patterns(tmp_path):
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stderr
     name_pat, name_ci, wake_pat, wake_ci = json.loads(r.stdout.strip().splitlines()[-1])
-    assert name_pat == r"\b(?:Amos|Ammos|Amus|Famous|Almost)\b"
-    assert wake_pat == r"^[\W_]*(?:hey|hi|hello|okay|ok|yo)[,.!]?\s+(?:amos|ammos|amus)\b"
+    assert name_pat == r"\b(?:Lomin|Lommin|Lowmin|Lemon|Loaming)\b"
+    assert wake_pat == r"^[\W_]*(?:hey|hi|hello|okay|ok|yo)[,.!]?\s+(?:lomin|lommin|lowmin)\b"
     assert name_ci and wake_ci

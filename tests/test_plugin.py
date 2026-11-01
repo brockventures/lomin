@@ -97,8 +97,8 @@ def test_empty_name_defaults_are_off(tmp_path):
     code = (
         "import json, gateway as g\n"
         "print(json.dumps({'names': list(g.AGENT_NAME_VARIANTS),\n"
-        "  'mentioned': g._name_mentioned('hey Amos'),\n"
-        "  'wake': g.WAKE_PHRASE_RE.match('hey Amos what time') is not None,\n"
+        "  'mentioned': g._name_mentioned('hey Lomin'),\n"
+        "  'wake': g.WAKE_PHRASE_RE.match('hey Lomin what time') is not None,\n"
         "  'phrase': g._variants_phrase(), 'agent': g.AGENT_NAME}))\n"
     )
     r = _run(code, tmp_path)

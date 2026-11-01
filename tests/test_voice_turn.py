@@ -55,7 +55,7 @@ def stubs(monkeypatch):
     """Stage stubs that record the order they ran in."""
     c = Calls()
     c.gate = ("passed", 900.0, 1.0)
-    c.transcript = "what's the weather, Amos"
+    c.transcript = "what's the weather, Lomin"
     c.identify = ("", 0.0)
     c.classify = {"score": 0.9, "classifier": "jev", "laya_score": None}
     c.reply = "It is sunny."
@@ -156,7 +156,7 @@ def test_stage_order_and_events(server, stubs):
     assert pos("turn") < pos("transcript") < pos("sentence") < pos("reply") < pos("done")
     assert ns[-1] == "done" and ns.count("reply") == 1
     tr = first(events, "transcript")
-    assert tr["text"] == tr["transcript"] == "what's the weather, Amos"
+    assert tr["text"] == tr["transcript"] == "what's the weather, Lomin"
     sent = first(events, "sentence")
     assert sent["text"] and base64.b64decode(sent["audio_b64"]).startswith(b"RIFF")
     assert first(events, "reply")["text"] == "It is sunny."
@@ -191,7 +191,7 @@ def test_transcribe_and_identify_run_in_parallel(server, stubs, monkeypatch):
     def slow_transcribe(wav):
         starts["transcribe"] = time.time()
         time.sleep(0.4)
-        return "hello Amos"
+        return "hello Lomin"
 
     def slow_identify(wav, sha):
         starts["identify"] = time.time()
@@ -317,7 +317,7 @@ def test_voice_id_verdict_strings(server, stubs, brain, ident, verdict, speaker)
     p = brain[0]["prompt"]
     assert p.startswith(f"[VOICE via node lammen · {speaker}")
     assert f"voice ID: {verdict}" in p
-    assert "what's the weather, Amos" in p
+    assert "what's the weather, Lomin" in p
     assert "under 60 words" in p
     assert brain[0]["target"] == gateway.DEFAULT_TARGET
 

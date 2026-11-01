@@ -1,4 +1,4 @@
-# LÓMIN
+# Lomin Agent Voice Gateway
 
 A voice gateway that gives agents a voice. Part of the [Karakos](https://github.com/mcarmody/karakos-package) stack.
 
@@ -272,11 +272,11 @@ Jev gives a second opinion on everything else:
    confident bar, or Laya timed out or errored: via the Vercel AI Gateway
    (`https://ai-gateway.vercel.sh/v1/evaluate`,
    key at `$MVG_HOME/secrets/vercel-ai-gateway`, model `typesafe-ai/jev`),
-   question key `addressed_to_amos`, `MVG_AMBIENT_JEV_TIMEOUT` (default
+   question key `addressed_to_agent`, `MVG_AMBIENT_JEV_TIMEOUT` (default
    2.5s), **single attempt** (`jev_retry=False`: classify()'s 1s-delay retry
    would blow the budget). Jev's score decides against the threshold, so a Jev
    yes overrides a Laya no. Voice-specific
-   instructions cover Whisper's name mishearings (the agent/Ammos/Amus/Famous/Almost),
+   instructions cover Whisper's name mishearings (the agent/Lommin/Lowmin/Lemon/Loaming),
    what "addressed" means (a request or question, by name anywhere in the
    sentence, or an unnamed follow-up inside an open conversation — see
    below), and that mentioning the agent to someone else, or TV/music audio, is
@@ -291,7 +291,7 @@ Jev gives a second opinion on everything else:
    answered: `engage: false`, `classifier: "none"`. Never guesses.
 
 `classifier` values: `"wake-phrase"` (a greeting plus the name opens the
-utterance, e.g. "hey the agent", "okay Ammos"; score 1.0, no classifier called),
+utterance, e.g. "hey the agent", "okay Lommin"; score 1.0, no classifier called),
 `"pregate"` (no name and no open conversation; score 0.0, no classifier called),
 `"laya"` (confident, or Laya-only fallback),
 `"laya+jev"` / `"laya+haiku"` (Laya ran and was not confident, the second
