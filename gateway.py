@@ -207,6 +207,14 @@ from side_channel import (  # noqa: E402,F401
     forward_artifacts_to_webhook,
     reply_expects_reply,
 )
+from pending_and_auth import (  # noqa: E402,F401
+    BearerTokenVerifier,
+    PendingVoiceAnswerStore,
+    get_device_token_verifier,
+    get_pending_store,
+    has_defer_marker,
+    strip_defer_marker,
+)
 
 # --- Plugin ------------------------------------------------------------
 # MVG_PLUGIN names an importable module that supplies household parts.
@@ -564,6 +572,7 @@ def record_reply(node_id: str, reply: str) -> None:
     ("and tomorrow?") is continuing that specific reply."""
     if not node_id:
         return
+    reply = strip_defer_marker(reply)
     with _ambient_lock:
         now = _now()
         _ambient_last_reply[node_id] = (now, reply)
@@ -2132,6 +2141,7 @@ def synthesize(text: str) -> tuple[bytes, str]:
     failure is recorded as "<name>:<error>". If an entry after the first one
     speaks, the failures are logged with log_fallback(). If every entry fails,
     raises RuntimeError with all the reasons."""
+    text = strip_defer_marker(text)
     reasons = []
     for idx, name in enumerate(TTS_CHAIN):
         try:
@@ -2224,6 +2234,7 @@ def synthesize_stream(text: str):
     converted to PCM. A desktop that answers the stream request with a full
     WAV (Chatterbox unavailable) is handled the same way. Raises only if
     every engine fails."""
+    text = strip_defer_marker(text)
     if not TTS_CHAIN or TTS_CHAIN[0] != "desktop":
         # Desktop streaming is not first in the chain: take the same path as
         # a failed desktop stream, so the chain (synthesize) decides.
@@ -2397,6 +2408,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/health":
             return self._handle_health()
+        if path == "/voice/pending" and (os.environ.get("MVG_ENABLE_DEFER", "0") == "1"):
+            return self._handle_pending_get()
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -2431,6 +2444,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return self._handle_speech()
         if path == "/embed":
             return self._handle_embed()
+        if path == "/voice/pending" and (os.environ.get("MVG_ENABLE_DEFER", "0") == "1"):
+            return self._handle_pending_post()
         self._send_json(404, {"error": "not found"})
 
     # -- /health --
@@ -2443,6 +2458,67 @@ class GatewayHandler(BaseHTTPRequestHandler):
         upstreams["piper_binary_present"] = os.path.exists(piper_binary)
         self._send_json(200, {"status": "ok", "upstreams": upstreams})
         log_request("/health", (time.time() - t0) * 1000, "ok")
+
+    # -- /voice/pending (deferred async voice answers) --
+
+    def _handle_pending_get(self):
+        t0 = time.time()
+        parsed = urlsplit(self.path)
+        qs = parse_qs(parsed.query)
+        node = (qs.get("node") or qs.get("node_id") or [""])[0].strip()
+        if not node:
+            self._send_json(400, {"error": "node parameter required"})
+            log_request("/voice/pending", (time.time() - t0) * 1000, "error:no_node")
+            return
+
+        pop_param = qs.get("pop", ["1"])[0].lower()
+        peek_param = qs.get("peek", ["0"])[0].lower()
+        should_pop = pop_param in ("1", "true", "yes") and peek_param not in ("1", "true", "yes")
+
+        store = get_pending_store()
+        item = store.pop_for_node(node) if should_pop else store.peek_for_node(node)
+        has_pending = item is not None
+        self._send_json(200, {
+            "status": "ok",
+            "node": node,
+            "has_pending": has_pending,
+            "pending": item,
+            "item": item,
+            "popped": should_pop and has_pending,
+        })
+        log_request("/voice/pending", (time.time() - t0) * 1000, "ok", node=node, has_pending=has_pending)
+
+    def _handle_pending_post(self):
+        t0 = time.time()
+        body = self._read_body()
+        try:
+            req = json.loads(body.decode("utf-8")) if body else {}
+        except Exception:
+            req = {}
+        node = (req.get("node_id") or req.get("node") or "").strip()
+        answer = (req.get("answer") or "").strip()
+        prompt = (req.get("prompt") or "").strip()
+        topic = (req.get("topic") or "").strip()
+
+        if not node:
+            self._send_json(400, {"error": "node_id required"})
+            log_request("/voice/pending", (time.time() - t0) * 1000, "error:no_node")
+            return
+        if not answer:
+            self._send_json(400, {"error": "answer required"})
+            log_request("/voice/pending", (time.time() - t0) * 1000, "error:no_answer", node=node)
+            return
+
+        store = get_pending_store()
+        item = store.store(node_id=node, prompt=prompt, answer=answer, topic=topic)
+        self._send_json(200, {
+            "status": "ok",
+            "stored": True,
+            "pending": item,
+            "item": item,
+            "node": node,
+        })
+        log_request("/voice/pending", (time.time() - t0) * 1000, "ok", node=node)
 
     # -- /stt --
 
@@ -2708,6 +2784,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 reply = strip_markdown(raw)
                 if os.environ.get("MVG_ARTIFACT_WEBHOOK_URL"):
                     reply, _ = forward_artifacts_to_webhook(raw, reply)
+                reply = strip_defer_marker(reply)
                 # Only a real answer opens the follow-up window for /ambient
                 # — the apology isn't a conversational turn worth treating
                 # as "the agent is mid-conversation" on this node.
@@ -2756,6 +2833,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
     STREAM_STATUS_POLL_SEC = 0.15
 
     def _synthesize_for_stream(self, text: str) -> tuple[bytes, str, str]:
+        text = strip_defer_marker(text)
         wav_bytes, engine = synthesize(text)
         # MIRRORMERE-ONE-FORMAT: every sentence emitted on this stream is
         # 24 kHz mono 16-bit WAV, regardless of which engine spoke it — the
@@ -3162,7 +3240,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             nonlocal spoken_text
             # Strip only the part whose markdown is settled: an unclosed link
             # or code span would otherwise collapse later and shift offsets.
-            full_stripped = strip_markdown(stable_markdown_prefix(full_raw_text)) or ""
+            full_stripped = strip_defer_marker(strip_markdown(stable_markdown_prefix(full_raw_text)) or "")
             delta = unspoken_delta(full_stripped, spoken_text)
             if not delta:
                 return
@@ -3333,6 +3411,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 reply = strip_markdown(raw)
                 if os.environ.get("MVG_ARTIFACT_WEBHOOK_URL"):
                     reply, _ = forward_artifacts_to_webhook(raw, reply)
+                reply = strip_defer_marker(reply)
                 # Only a real answer opens the follow-up window for
                 # /ambient — same rule as /ask (see its own comment above).
                 # Without this, a hub that switches to /ask/stream loses
@@ -3440,6 +3519,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return
         node_id = forced_node or requested_node
         _set_req_node(node_id)
+
+        verifier = get_device_token_verifier()
+        if verifier.is_enabled:
+            auth_header = self.headers.get("Authorization", "")
+            if not verifier.verify(auth_header, node_id):
+                self._send_json(401, {"error": "unauthorized"})
+                log_request("/voice/turn", (time.time() - t0) * 1000, "error:unauthorized", node=node_id)
+                return
+
         if not node_id:
             self._send_json(400, {"error": "node_id required"})
             log_request("/voice/turn", (time.time() - t0) * 1000, "error:no_node")
@@ -3618,6 +3706,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         except Exception:
             req = {}
         text = (req.get("input") or "").strip()
+        text = strip_defer_marker(text)
         if not text:
             self._send_json(400, {"error": "input is required"})
             log_request("/v1/audio/speech", (time.time() - t0) * 1000, "error:no_input")
