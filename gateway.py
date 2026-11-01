@@ -195,6 +195,12 @@ from audio_utils import (  # noqa: E402,F401
     AUDIO_TARGET_CHANNELS, AUDIO_TARGET_RATE, AUDIO_TARGET_SAMPWIDTH,
     normalize_wav, pcm_to_wav,
 )
+from vision_adpcm import (  # noqa: E402,F401
+    ADPCM_MAGIC,
+    build_vision_filler,
+    decode_adpcm_to_wav,
+    extract_vision_payloads,
+)
 
 # --- Plugin ------------------------------------------------------------
 # MVG_PLUGIN names an importable module that supplies household parts.
@@ -252,6 +258,10 @@ AGENT_LABEL = os.environ.get("MVG_AGENT_LABEL", "agent")
 CLASSIFY_KEY = os.environ.get("MVG_CLASSIFY_KEY", "lomin.ambient")
 # The request log file name under LOG_DIR.
 LOG_NAME = os.environ.get("MVG_LOG_NAME", "lomin.jsonl")
+
+# Multimodal camera & BLE IMA ADPCM ingest flags (Chunk 1 parity)
+ENABLE_VISION = os.environ.get("MVG_ENABLE_VISION", "0") == "1"
+ENABLE_ADPCM = os.environ.get("MVG_ENABLE_ADPCM", "0") == "1"
 
 WHISPER_URL = os.environ.get("WHISPER_URL", "http://127.0.0.1:9099/transcribe")
 WHISPER_HEALTH_URL = os.environ.get(
@@ -1595,11 +1605,17 @@ def legacy_voice_id(speaker: str, speaker_score) -> dict:
 
 def make_frame_ctx(voice_id: dict | None, claimed_speaker: str = "", open_room: bool = False,
                    reply_cap_words: int = 60, enrolled: str | None = None,
-                   device: str = "", medium: str = "", target: str = "") -> dict:
-    return {"enrolled": enrolled, "voice_id": voice_id or {"status": "unavailable", "id": "", "score": 0.0},
-            "claimed_speaker": claimed_speaker or "", "open_room": bool(open_room),
-            "reply_cap_words": reply_cap_words, "device": device or "", "medium": medium or "",
-            "target": target or ""}
+                   device: str = "", medium: str = "", target: str = "",
+                   image_b64: str | None = None, burst_images_b64: list[str] | None = None) -> dict:
+    ctx = {"enrolled": enrolled, "voice_id": voice_id or {"status": "unavailable", "id": "", "score": 0.0},
+           "claimed_speaker": claimed_speaker or "", "open_room": bool(open_room),
+           "reply_cap_words": reply_cap_words, "device": device or "", "medium": medium or "",
+           "target": target or ""}
+    if image_b64:
+        ctx["image_b64"] = image_b64
+    if burst_images_b64:
+        ctx["burst_images_b64"] = burst_images_b64
+    return ctx
 
 
 def _display_name(name: str) -> str:
@@ -1664,17 +1680,28 @@ MVG_BRAIN_TOKEN = os.environ.get("MVG_BRAIN_TOKEN", "")
 
 
 def http_brain_call(prompt: str, session_id: str, node_id: str, speaker: str,
-                    speaker_score, timeout: int) -> str:
+                    speaker_score, timeout: int,
+                    image_b64: str | None = None, burst_images_b64: list[str] | None = None) -> str:
     """Brain over plain HTTP (standalone). POSTs the framed prompt as JSON to
     MVG_BRAIN_URL and returns the response's "reply" string."""
     if not MVG_BRAIN_URL:
         raise RuntimeError("MVG_BRAIN_URL not set")
-    body = json.dumps({
+    body_dict = {
         "prompt": _frame_for_call(prompt, node_id, speaker, speaker_score),
         "session_id": session_id,
         "node_id": node_id,
         "target": _call_target(node_id),
-    }).encode("utf-8")
+    }
+    enable_vision = bool(ENABLE_VISION) or (os.environ.get("MVG_ENABLE_VISION", "0") == "1")
+    if enable_vision:
+        ctx = getattr(_FRAME_CTX, "ctx", None) or {}
+        img = image_b64 or ctx.get("image_b64")
+        burst = burst_images_b64 or ctx.get("burst_images_b64")
+        if img:
+            body_dict["image_b64"] = img
+        if burst:
+            body_dict["burst_images_b64"] = burst
+    body = json.dumps(body_dict).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if MVG_BRAIN_TOKEN:
         headers["Authorization"] = f"Bearer {MVG_BRAIN_TOKEN}"
@@ -1688,10 +1715,12 @@ def http_brain_call(prompt: str, session_id: str, node_id: str, speaker: str,
 
 
 def http_brain_call_stream(prompt: str, session_id: str, node_id: str, speaker: str,
-                           speaker_score, timeout: int, on_partial) -> str:
+                           speaker_score, timeout: int, on_partial,
+                           image_b64: str | None = None, burst_images_b64: list[str] | None = None) -> str:
     """Streaming shape for the http brain: no partials, so one on_partial
     call with the full reply."""
-    reply = http_brain_call(prompt, session_id, node_id, speaker, speaker_score, timeout)
+    reply = http_brain_call(prompt, session_id, node_id, speaker, speaker_score, timeout,
+                            image_b64=image_b64, burst_images_b64=burst_images_b64)
     on_partial(reply)
     return reply
 
@@ -2922,10 +2951,23 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     return
                 if fast["intent"]:  # matched but the handler failed: still a brain turn
                     intent_rec["intent_fallthrough"] = f"{fast['intent']}:{fast['reason']}"
-                result_box["reply"] = STREAM_BRAIN_CALL(
-                    prompt, session_id, node_id, speaker, speaker_score,
-                    HIVE_TIMEOUT, on_partial,
-                )
+                call_kwargs = {}
+                enable_vision = bool(ENABLE_VISION) or (os.environ.get("MVG_ENABLE_VISION", "0") == "1")
+                if enable_vision:
+                    if ctx.get("image_b64"):
+                        call_kwargs["image_b64"] = ctx["image_b64"]
+                    if ctx.get("burst_images_b64"):
+                        call_kwargs["burst_images_b64"] = ctx["burst_images_b64"]
+                try:
+                    result_box["reply"] = STREAM_BRAIN_CALL(
+                        prompt, session_id, node_id, speaker, speaker_score,
+                        HIVE_TIMEOUT, on_partial, **call_kwargs,
+                    )
+                except TypeError:
+                    result_box["reply"] = STREAM_BRAIN_CALL(
+                        prompt, session_id, node_id, speaker, speaker_score,
+                        HIVE_TIMEOUT, on_partial,
+                    )
             except Exception as exc:
                 result_box["error"] = str(exc)
             finally:
@@ -3095,12 +3137,31 @@ class GatewayHandler(BaseHTTPRequestHandler):
         content_type = self.headers.get("Content-Type", "")
         body = self._read_body()
         wav_bytes, fields = None, {}
+        image_bytes: bytes | None = None
+        burst_images: list[bytes] = []
+
+        enable_adpcm = bool(ENABLE_ADPCM) or (os.environ.get("MVG_ENABLE_ADPCM", "0") == "1")
+        enable_vision = bool(ENABLE_VISION) or (os.environ.get("MVG_ENABLE_VISION", "0") == "1")
+
         if content_type.startswith("multipart/form-data"):
             parts = parse_multipart_parts(body, content_type)
+            if enable_vision:
+                image_bytes, burst_images = extract_vision_payloads(parts)
             wav_bytes = parts.pop("audio", None)
             fields = {k: v.decode("utf-8", "replace").strip() for k, v in parts.items()}
+            if enable_vision and not image_bytes and not burst_images:
+                image_bytes, burst_images = extract_vision_payloads(fields)
         elif content_type in ("audio/wav", "application/octet-stream", ""):
             wav_bytes = body
+
+        if enable_adpcm and wav_bytes:
+            wav_bytes = decode_adpcm_to_wav(wav_bytes)
+
+        if enable_vision and not image_bytes and not burst_images and qs:
+            image_bytes, burst_images = extract_vision_payloads({k: v[0] for k, v in qs.items() if v})
+
+        image_b64 = base64.b64encode(image_bytes).decode("ascii") if image_bytes else None
+        burst_images_b64 = [base64.b64encode(b).decode("ascii") for b in burst_images] if burst_images else []
 
         def opt(name: str):
             """Multipart field first, then the query string; None if absent."""
@@ -3259,7 +3320,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         # 5 + 6. Brain, then speak
         ctx = make_frame_ctx(vid, claimed_speaker=claimed, open_room=open_room,
                              reply_cap_words=int(prof["reply_cap_words"]),
-                             device=device, medium=medium, target=target)
+                             device=device, medium=medium, target=target,
+                             image_b64=image_b64, burst_images_b64=burst_images_b64)
         target_extra = {"target_rejected": True} if (
             requested_target and requested_target != target) else {}
         self._stream_brain_turn(
