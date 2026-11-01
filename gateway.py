@@ -263,6 +263,10 @@ LOG_NAME = os.environ.get("MVG_LOG_NAME", "lomin.jsonl")
 ENABLE_VISION = os.environ.get("MVG_ENABLE_VISION", "0") == "1"
 ENABLE_ADPCM = os.environ.get("MVG_ENABLE_ADPCM", "0") == "1"
 
+# Streaming SSE HTTP brain & direct-audio flags (Chunk 2 parity)
+HTTP_BRAIN_STREAM = os.environ.get("MVG_HTTP_STREAM", "0") == "1"
+BRAIN_DIRECT_AUDIO = os.environ.get("MVG_BRAIN_DIRECT_AUDIO", "0") == "1"
+
 WHISPER_URL = os.environ.get("WHISPER_URL", "http://127.0.0.1:9099/transcribe")
 WHISPER_HEALTH_URL = os.environ.get(
     "WHISPER_HEALTH_URL",
@@ -1606,7 +1610,8 @@ def legacy_voice_id(speaker: str, speaker_score) -> dict:
 def make_frame_ctx(voice_id: dict | None, claimed_speaker: str = "", open_room: bool = False,
                    reply_cap_words: int = 60, enrolled: str | None = None,
                    device: str = "", medium: str = "", target: str = "",
-                   image_b64: str | None = None, burst_images_b64: list[str] | None = None) -> dict:
+                   image_b64: str | None = None, burst_images_b64: list[str] | None = None,
+                   audio_b64: str | None = None) -> dict:
     ctx = {"enrolled": enrolled, "voice_id": voice_id or {"status": "unavailable", "id": "", "score": 0.0},
            "claimed_speaker": claimed_speaker or "", "open_room": bool(open_room),
            "reply_cap_words": reply_cap_words, "device": device or "", "medium": medium or "",
@@ -1615,6 +1620,8 @@ def make_frame_ctx(voice_id: dict | None, claimed_speaker: str = "", open_room: 
         ctx["image_b64"] = image_b64
     if burst_images_b64:
         ctx["burst_images_b64"] = burst_images_b64
+    if audio_b64:
+        ctx["audio_b64"] = audio_b64
     return ctx
 
 
@@ -1679,9 +1686,118 @@ MVG_BRAIN_URL = os.environ.get("MVG_BRAIN_URL", "")
 MVG_BRAIN_TOKEN = os.environ.get("MVG_BRAIN_TOKEN", "")
 
 
+def consume_brain_sse_lines(lines, on_partial=None) -> str:
+    """Consume Server-Sent Events (SSE) lines from an HTTP brain stream.
+
+    Supports SSE `event: sentence`, `event: delta`, and `event: reply`
+    (with JSON {"text": ...} or {"reply": ...}) as well as OpenAI-style
+    `data: {"choices": [{"delta": {"content": ...}}]}` lines.
+    Calls `on_partial(accumulated_text)` as each text chunk arrives.
+    Returns the final reply string.
+    """
+    current_event = ""
+    accumulated = ""
+    final_reply = ""
+
+    for raw_line in lines:
+        if isinstance(raw_line, (bytes, bytearray)):
+            line = raw_line.decode("utf-8", errors="replace")
+        else:
+            line = str(raw_line)
+
+        line = line.rstrip("\r\n")
+
+        if not line:
+            current_event = ""
+            continue
+
+        if line.startswith(":"):
+            continue
+
+        if line.startswith("event:"):
+            current_event = line[6:].strip()
+            continue
+
+        if line.startswith("data:"):
+            data_str = line[5:].strip()
+            if not data_str or data_str == "[DONE]":
+                continue
+
+            try:
+                payload = json.loads(data_str)
+            except Exception:
+                payload = data_str
+
+            if isinstance(payload, dict) and "choices" in payload:
+                choices = payload.get("choices")
+                if isinstance(choices, list) and choices:
+                    c0 = choices[0]
+                    if isinstance(c0, dict):
+                        delta = c0.get("delta")
+                        if isinstance(delta, dict):
+                            content = delta.get("content")
+                            if isinstance(content, str) and content:
+                                accumulated += content
+                                if on_partial:
+                                    on_partial(accumulated)
+                                continue
+
+            chunk = ""
+            if isinstance(payload, dict):
+                if current_event == "reply":
+                    chunk = payload.get("reply") or payload.get("text") or ""
+                elif current_event == "sentence":
+                    chunk = payload.get("text") or payload.get("reply") or ""
+                elif current_event == "delta":
+                    chunk = payload.get("text") or payload.get("delta") or payload.get("reply") or ""
+                else:
+                    if "reply" in payload and not ("text" in payload or "delta" in payload):
+                        chunk = payload["reply"]
+                        final_reply = chunk
+                    elif "text" in payload:
+                        chunk = payload["text"]
+                    elif "delta" in payload:
+                        chunk = payload["delta"]
+                    else:
+                        chunk = payload.get("reply") or ""
+            elif isinstance(payload, str):
+                chunk = payload
+
+            if not isinstance(chunk, str) or not chunk:
+                continue
+
+            if current_event == "reply":
+                accumulated = chunk
+                final_reply = chunk
+                if on_partial:
+                    on_partial(accumulated)
+            elif current_event == "sentence":
+                if accumulated and not accumulated.endswith((" ", "\n")) and not chunk.startswith(" "):
+                    accumulated += " " + chunk
+                else:
+                    accumulated += chunk
+                if on_partial:
+                    on_partial(accumulated)
+            elif current_event == "delta":
+                accumulated += chunk
+                if on_partial:
+                    on_partial(accumulated)
+            else:
+                if final_reply and accumulated == chunk:
+                    if on_partial:
+                        on_partial(accumulated)
+                else:
+                    accumulated += chunk
+                    if on_partial:
+                        on_partial(accumulated)
+
+    return final_reply if final_reply else accumulated
+
+
 def http_brain_call(prompt: str, session_id: str, node_id: str, speaker: str,
                     speaker_score, timeout: int,
-                    image_b64: str | None = None, burst_images_b64: list[str] | None = None) -> str:
+                    image_b64: str | None = None, burst_images_b64: list[str] | None = None,
+                    audio_b64: str | None = None) -> str:
     """Brain over plain HTTP (standalone). POSTs the framed prompt as JSON to
     MVG_BRAIN_URL and returns the response's "reply" string."""
     if not MVG_BRAIN_URL:
@@ -1701,12 +1817,22 @@ def http_brain_call(prompt: str, session_id: str, node_id: str, speaker: str,
             body_dict["image_b64"] = img
         if burst:
             body_dict["burst_images_b64"] = burst
+    brain_direct_audio = bool(BRAIN_DIRECT_AUDIO) or (os.environ.get("MVG_BRAIN_DIRECT_AUDIO", "0") == "1")
+    if brain_direct_audio:
+        ctx = getattr(_FRAME_CTX, "ctx", None) or {}
+        aud = audio_b64 or ctx.get("audio_b64")
+        if aud:
+            body_dict["audio_b64"] = aud
     body = json.dumps(body_dict).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if MVG_BRAIN_TOKEN:
         headers["Authorization"] = f"Bearer {MVG_BRAIN_TOKEN}"
     req = Request(MVG_BRAIN_URL, data=body, headers=headers, method="POST")
     with urlopen(req, timeout=timeout) as resp:
+        headers_obj = getattr(resp, "headers", None)
+        content_type = headers_obj.get("Content-Type", "") if hasattr(headers_obj, "get") else ""
+        if "text/event-stream" in content_type:
+            return consume_brain_sse_lines(resp, on_partial=None)
         data = json.loads(resp.read().decode("utf-8"))
     reply = data.get("reply")
     if not isinstance(reply, str):
@@ -1716,12 +1842,56 @@ def http_brain_call(prompt: str, session_id: str, node_id: str, speaker: str,
 
 def http_brain_call_stream(prompt: str, session_id: str, node_id: str, speaker: str,
                            speaker_score, timeout: int, on_partial,
-                           image_b64: str | None = None, burst_images_b64: list[str] | None = None) -> str:
-    """Streaming shape for the http brain: no partials, so one on_partial
-    call with the full reply."""
-    reply = http_brain_call(prompt, session_id, node_id, speaker, speaker_score, timeout,
-                            image_b64=image_b64, burst_images_b64=burst_images_b64)
-    on_partial(reply)
+                           image_b64: str | None = None, burst_images_b64: list[str] | None = None,
+                           audio_b64: str | None = None) -> str:
+    """Streaming shape for the http brain: incrementally consumes SSE lines via
+    consume_brain_sse_lines when HTTP_BRAIN_STREAM is enabled (or Content-Type
+    is text/event-stream); otherwise preserves the standard JSON path."""
+    if not MVG_BRAIN_URL:
+        raise RuntimeError("MVG_BRAIN_URL not set")
+
+    is_stream = bool(HTTP_BRAIN_STREAM) or (os.environ.get("MVG_HTTP_STREAM", "0") == "1")
+    body_dict = {
+        "prompt": _frame_for_call(prompt, node_id, speaker, speaker_score),
+        "session_id": session_id,
+        "node_id": node_id,
+        "target": _call_target(node_id),
+    }
+    enable_vision = bool(ENABLE_VISION) or (os.environ.get("MVG_ENABLE_VISION", "0") == "1")
+    if enable_vision:
+        ctx = getattr(_FRAME_CTX, "ctx", None) or {}
+        img = image_b64 or ctx.get("image_b64")
+        burst = burst_images_b64 or ctx.get("burst_images_b64")
+        if img:
+            body_dict["image_b64"] = img
+        if burst:
+            body_dict["burst_images_b64"] = burst
+    brain_direct_audio = bool(BRAIN_DIRECT_AUDIO) or (os.environ.get("MVG_BRAIN_DIRECT_AUDIO", "0") == "1")
+    if brain_direct_audio:
+        ctx = getattr(_FRAME_CTX, "ctx", None) or {}
+        aud = audio_b64 or ctx.get("audio_b64")
+        if aud:
+            body_dict["audio_b64"] = aud
+
+    body = json.dumps(body_dict).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if is_stream:
+        headers["Accept"] = "text/event-stream, application/json"
+    if MVG_BRAIN_TOKEN:
+        headers["Authorization"] = f"Bearer {MVG_BRAIN_TOKEN}"
+
+    req = Request(MVG_BRAIN_URL, data=body, headers=headers, method="POST")
+    with urlopen(req, timeout=timeout) as resp:
+        headers_obj = getattr(resp, "headers", None)
+        content_type = headers_obj.get("Content-Type", "") if hasattr(headers_obj, "get") else ""
+        if "text/event-stream" in content_type or (is_stream and "application/json" not in content_type):
+            reply = consume_brain_sse_lines(resp, on_partial=on_partial)
+        else:
+            data = json.loads(resp.read().decode("utf-8"))
+            reply = data.get("reply")
+            if not isinstance(reply, str):
+                raise RuntimeError("MVG_BRAIN_URL response has no reply string")
+            on_partial(reply)
     return reply
 
 
@@ -2429,7 +2599,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         speaker_score = req.get("speaker_score")
         _set_req_node(node_id)
         ctx = self._legacy_ctx(speaker, speaker_score, node_id,
-                               self._req_tag(req, "device"), self._req_tag(req, "medium"))
+                               self._req_tag(req, "device"), self._req_tag(req, "medium"),
+                               image_b64=req.get("image_b64"), burst_images_b64=req.get("burst_images_b64"),
+                               audio_b64=req.get("audio_b64"))
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -2560,7 +2732,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             t0=t0, turn_id=turn_id, prompt=prompt, session_id=session_id, node_id=node_id,
             speaker=speaker, speaker_score=speaker_score,
             ctx=self._legacy_ctx(speaker, speaker_score, node_id,
-                                 self._req_tag(req, "device"), self._req_tag(req, "medium")),
+                                 self._req_tag(req, "device"), self._req_tag(req, "medium"),
+                                 image_b64=req.get("image_b64"), burst_images_b64=req.get("burst_images_b64"),
+                                 audio_b64=req.get("audio_b64")),
             endpoint="/ask/stream", opts={})
 
     def _handle_intent(self):
@@ -2629,7 +2803,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return v if v else self.headers.get(f"X-Voice-{name.capitalize()}")
 
     def _legacy_ctx(self, speaker: str, speaker_score, node_id: str,
-                    device=None, medium=None) -> dict:
+                    device=None, medium=None, image_b64: str | None = None,
+                    burst_images_b64: list[str] | None = None,
+                    audio_b64: str | None = None) -> dict:
         """Framing context for the legacy endpoints: the hub's speaker (set
         only on a match) + speaker_score are the voice ID match. A trusted
         claimed_speaker header is honoured the same as on /voice/turn."""
@@ -2637,7 +2813,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         dev, med = resolve_device_medium(node_id, device, medium)
         return make_frame_ctx(legacy_voice_id(speaker, speaker_score), claimed_speaker=claimed,
                               reply_cap_words=resolve_profile(node_id)["reply_cap_words"],
-                              device=dev, medium=med)
+                              device=dev, medium=med,
+                              image_b64=image_b64, burst_images_b64=burst_images_b64,
+                              audio_b64=audio_b64)
 
     def _trusted_claimed_speaker(self) -> tuple[str, bool]:
         """(claimed_speaker, rejected). Honoured only with the shared secret:
@@ -2958,6 +3136,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         call_kwargs["image_b64"] = ctx["image_b64"]
                     if ctx.get("burst_images_b64"):
                         call_kwargs["burst_images_b64"] = ctx["burst_images_b64"]
+                brain_direct_audio = bool(BRAIN_DIRECT_AUDIO) or (os.environ.get("MVG_BRAIN_DIRECT_AUDIO", "0") == "1")
+                if brain_direct_audio:
+                    if ctx.get("audio_b64"):
+                        call_kwargs["audio_b64"] = ctx["audio_b64"]
                 try:
                     result_box["reply"] = STREAM_BRAIN_CALL(
                         prompt, session_id, node_id, speaker, speaker_score,
@@ -3318,10 +3500,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
             _record_ambient_transcript(node_id, transcript, speaker_id)
 
         # 5 + 6. Brain, then speak
+        brain_direct_audio = bool(BRAIN_DIRECT_AUDIO) or (os.environ.get("MVG_BRAIN_DIRECT_AUDIO", "0") == "1")
+        audio_b64 = None
+        if brain_direct_audio and wav_bytes:
+            audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
         ctx = make_frame_ctx(vid, claimed_speaker=claimed, open_room=open_room,
                              reply_cap_words=int(prof["reply_cap_words"]),
                              device=device, medium=medium, target=target,
-                             image_b64=image_b64, burst_images_b64=burst_images_b64)
+                             image_b64=image_b64, burst_images_b64=burst_images_b64,
+                             audio_b64=audio_b64)
         target_extra = {"target_rejected": True} if (
             requested_target and requested_target != target) else {}
         self._stream_brain_turn(
