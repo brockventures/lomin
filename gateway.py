@@ -202,6 +202,11 @@ from vision_adpcm import (  # noqa: E402,F401
     extract_vision_payloads,
 )
 from ha_fastpath import try_ha_conversation  # noqa: E402,F401
+from side_channel import (  # noqa: E402,F401
+    emit_turn_transcript,
+    forward_artifacts_to_webhook,
+    reply_expects_reply,
+)
 
 # --- Plugin ------------------------------------------------------------
 # MVG_PLUGIN names an importable module that supplies household parts.
@@ -2701,18 +2706,34 @@ class GatewayHandler(BaseHTTPRequestHandler):
             else:
                 outcome = "ok"
                 reply = strip_markdown(raw)
+                if os.environ.get("MVG_ARTIFACT_WEBHOOK_URL"):
+                    reply, _ = forward_artifacts_to_webhook(raw, reply)
                 # Only a real answer opens the follow-up window for /ambient
                 # — the apology isn't a conversational turn worth treating
                 # as "the agent is mid-conversation" on this node.
                 record_reply(node_id, reply)
 
+        expects = reply_expects_reply(reply)
         try:
-            self.wfile.write(self._sse_event("reply", {"reply": reply}))
-            self.wfile.write(self._sse_event("done", {}))
+            self.wfile.write(self._sse_event("reply", {"reply": reply, "expects_reply": expects}))
+            self.wfile.write(self._sse_event("done", {"expects_reply": expects}))
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass
         log_request("/ask", (time.time() - t0) * 1000, outcome, node_id=node_id)
+        if os.environ.get("MVG_TRANSCRIPT_SINK_URL") or os.environ.get("MVG_TRANSCRIPT_LOG_PATH"):
+            emit_turn_transcript({
+                "kind": "ask",
+                "endpoint": "/ask",
+                "node_id": node_id or None,
+                "prompt": prompt,
+                "transcript": prompt,
+                "reply": reply,
+                "outcome": outcome,
+                "expects_reply": expects,
+                "total_ms": round((time.time() - t0) * 1000, 1),
+                "timestamp": time.time(),
+            })
 
     # -- /ask/stream (SSE, MANDOS) --
     #
@@ -3016,6 +3037,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
             rec.update(_correlated_stt(node_id, t0))
             _gap_turn_done(gap["used"])
             log_latency(rec)
+            if os.environ.get("MVG_TRANSCRIPT_SINK_URL") or os.environ.get("MVG_TRANSCRIPT_LOG_PATH"):
+                transcript_rec = dict(rec)
+                transcript_rec["prompt"] = prompt
+                transcript_rec["transcript"] = prompt
+                transcript_rec["reply"] = reply
+                transcript_rec["expects_reply"] = reply_expects_reply(reply)
+                emit_turn_transcript(transcript_rec)
 
         def _emit_gap_fill(categories, fallback=()) -> bool:
             """Emit one whole filler clip as pcm `sentence` events (text on
@@ -3303,6 +3331,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             else:
                 outcome = "ok"
                 reply = strip_markdown(raw)
+                if os.environ.get("MVG_ARTIFACT_WEBHOOK_URL"):
+                    reply, _ = forward_artifacts_to_webhook(raw, reply)
                 # Only a real answer opens the follow-up window for
                 # /ambient — same rule as /ask (see its own comment above).
                 # Without this, a hub that switches to /ask/stream loses
@@ -3338,13 +3368,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                       "is_final": True, "data": "",
                                       "sample_rate": AUDIO_TARGET_RATE,
                                       "channels": AUDIO_TARGET_CHANNELS})
+        expects = reply_expects_reply(reply)
         if voice:
             self._sse("reply", {"reply": reply, "text": reply,
-                                "tts_engine": timing["engine"] or ("text" if text_mode else "wav")})
-            self._sse("done", {"duration_ms": int((time.time() - t0) * 1000)})
+                                "tts_engine": timing["engine"] or ("text" if text_mode else "wav"),
+                                "expects_reply": expects})
+            self._sse("done", {"duration_ms": int((time.time() - t0) * 1000),
+                               "expects_reply": expects})
         else:
-            self._sse("reply", {"reply": reply})
-            self._sse("done", {})
+            self._sse("reply", {"reply": reply, "expects_reply": expects})
+            self._sse("done", {"expects_reply": expects})
         _finish(outcome, with_node=True)
         return (outcome, reply)
 
@@ -3358,6 +3391,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         content_type = self.headers.get("Content-Type", "")
         body = self._read_body()
         wav_bytes, fields = None, {}
+        transcript: str = ""
         image_bytes: bytes | None = None
         burst_images: list[bytes] = []
 
@@ -3449,6 +3483,23 @@ class GatewayHandler(BaseHTTPRequestHandler):
         def end(outcome: str, **extra) -> None:
             log_request("/voice/turn", (time.time() - t0) * 1000, outcome,
                         **{**log_extra, **extra})
+            if os.environ.get("MVG_TRANSCRIPT_SINK_URL") or os.environ.get("MVG_TRANSCRIPT_LOG_PATH"):
+                curr_tx = stt_box.get("text", "") if "stt_box" in locals() and isinstance(stt_box, dict) else (transcript if "transcript" in locals() else "")
+                emit_turn_transcript({
+                    "kind": "turn",
+                    "endpoint": "/voice/turn",
+                    "node_id": node_id or None,
+                    "session_id": session_id or None,
+                    "turn_id": turn_id,
+                    "prompt": curr_tx or "",
+                    "transcript": curr_tx or "",
+                    "reply": "",
+                    "outcome": outcome,
+                    "total_ms": round((time.time() - t0) * 1000, 1),
+                    "timestamp": time.time(),
+                    **log_extra,
+                    **extra,
+                })
 
         # 1 + 2. Speech gate || transcribe || identify. All three start together so
         # the gate (~1.3 s on slow hardware) adds no latency; a rejected clip just
