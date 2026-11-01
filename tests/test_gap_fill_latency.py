@@ -322,6 +322,7 @@ def test_stt_latency_record_and_correlation(gw, fake_tts, monkeypatch, tmp_path)
     import http.client
     monkeypatch.setattr(gateway, "transcribe", lambda wav: "hello there")
     monkeypatch.setattr(gateway, "_last_stt", {})
+    monkeypatch.setattr(gateway, "_last_stt_any", {})
     import io
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:

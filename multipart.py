@@ -7,6 +7,21 @@ import re
 
 # --- Multipart parsing (Python 3.13 has no cgi module) --------------------
 
+def _iter_parts(body: bytes, delim: bytes):
+    """Yield the spans between boundary lines one at a time. Unlike
+    body.split(delim), this never holds a second full copy of a large WAV
+    body: only the part currently being parsed is copied."""
+    view = memoryview(body)
+    start = 0
+    while True:
+        nxt = body.find(delim, start)
+        end = nxt if nxt != -1 else len(body)
+        yield bytes(view[start:end])
+        if nxt == -1:
+            return
+        start = nxt + len(delim)
+
+
 def parse_multipart_parts(body: bytes, content_type: str) -> dict[str, bytes]:
     """Hand-rolled multipart/form-data split. Returns {part_name: raw_bytes}
     for every named part found. A hand split is more predictable than
@@ -18,9 +33,8 @@ def parse_multipart_parts(body: bytes, content_type: str) -> dict[str, bytes]:
         return {}
     boundary = m.group(1).encode()
     delim = b"--" + boundary
-    parts = body.split(delim)
     out: dict[str, bytes] = {}
-    for part in parts:
+    for part in _iter_parts(body, delim):
         part = part.strip(b"\r\n")
         if not part or part == b"--":
             continue

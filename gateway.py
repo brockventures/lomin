@@ -188,7 +188,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sentence_segmenter import SentenceSegmenter, segment_full_text  # noqa: E402
 # Moved out of this file (ERED LOMIN P1b). Re-exported here so gateway.<name>
 # keeps resolving for callers and tests.
-from text_utils import strip_markdown  # noqa: E402,F401
+from text_utils import strip_markdown, stable_markdown_prefix, unspoken_delta  # noqa: E402,F401
 import tts_backends  # noqa: E402  (ERED LOMIN P1b: swappable TTS chain)
 from multipart import parse_multipart_parts, parse_multipart_audio  # noqa: E402,F401
 from audio_utils import (  # noqa: E402,F401
@@ -240,6 +240,9 @@ LOG_DIR = Path(os.environ.get("MVG_LOG_DIR") or (Path(__file__).resolve().parent
 # --- Config --------------------------------------------------------------
 
 PORT = int(os.environ.get("MVG_PORT", "9098"))
+# Largest request body the gateway will read (bytes). 20 MiB is about 10
+# minutes of 16 kHz mono 16-bit WAV, far above any real turn.
+MAX_BODY_BYTES = int(os.environ.get("MVG_MAX_BODY_BYTES", str(20 * 1024 * 1024)))
 BIND = os.environ.get("MVG_BIND", "0.0.0.0")
 # The agent's name, as the prompts and the spoken apology say it.
 AGENT_NAME = os.environ.get("MVG_AGENT_NAME", "the assistant")
@@ -672,7 +675,11 @@ def decide_addressed(node_id: str, transcript: str, speaker: str = "") -> dict:
                 "laya_score": None}
     state = _build_ambient_state(node_id, transcript, speaker)
     turns = _build_ambient_turns(node_id, transcript, speaker)
-    return classify_addressed_detail(state, turns, name_present=named)
+    # With no MVG_AGENT_NAMES configured there is no name to look for, so
+    # "name absent" carries no signal: let Laya engage as it would after a
+    # named utterance instead of silently disabling the fast path.
+    name_present = named or _AGENT_NAME_RE is None
+    return classify_addressed_detail(state, turns, name_present=name_present)
 
 
 def _addressed_score(result) -> float:
@@ -1020,7 +1027,12 @@ def log_fallback(reason: str, tts_engine: str = "piper", **extra) -> None:
 
 LATENCY_LOG_NAME = "voice-latency.jsonl"
 STT_CORRELATE_SEC = float(os.environ.get("MVG_STT_CORRELATE_SEC", "30"))
-_last_stt: dict = {}
+# Most recent /stt per node ("" when the node is unknown), plus the newest
+# overall for callers that do not know their node. Guarded by _last_stt_lock:
+# two rooms talking at once must not clobber each other's correlation.
+_last_stt: dict[str, dict] = {}
+_last_stt_any: dict = {}
+_last_stt_lock = threading.Lock()
 
 
 def _iso_now() -> str:
@@ -1044,16 +1056,24 @@ def _wav_seconds(wav_bytes: bytes) -> float | None:
 def _note_stt(node_id: str, audio_s, stt_ms: float, chars: int, cache_hit: bool) -> None:
     stt_id = uuid.uuid4().hex[:12]
     now = time.time()
-    _last_stt.clear()
-    _last_stt.update({"stt_id": stt_id, "node_id": node_id, "t_end": now,
-                      "stt_ms": round(stt_ms, 1)})
+    rec = {"stt_id": stt_id, "node_id": node_id, "t_end": now,
+           "stt_ms": round(stt_ms, 1)}
+    with _last_stt_lock:
+        _last_stt[node_id or ""] = rec
+        _last_stt_any.clear()
+        _last_stt_any.update(rec)
     log_latency({"kind": "stt", "stt_id": stt_id, "node_id": node_id or None,
                  "audio_s": audio_s, "stt_ms": round(stt_ms, 1), "chars": chars,
                  "cache_hit": cache_hit})
 
 
 def _correlated_stt(node_id: str, request_start: float) -> dict:
-    s = dict(_last_stt)
+    with _last_stt_lock:
+        if node_id:
+            # This node's own /stt, else one from a caller that sent no node.
+            s = dict(_last_stt.get(node_id) or _last_stt.get("") or {})
+        else:
+            s = dict(_last_stt_any)
     if not s or request_start - s["t_end"] > STT_CORRELATE_SEC or request_start < s["t_end"] - 1:
         return {}
     if s.get("node_id") and node_id and s["node_id"] != node_id:
@@ -2065,6 +2085,10 @@ def synthesize_chunked(text: str) -> tuple[bytes, str]:
 
 # --- HTTP handler ------------------------------------------------------------
 
+class _BodyRejected(Exception):
+    """Raised by GatewayHandler._read_body after it has sent a 400/413."""
+
+
 class GatewayHandler(BaseHTTPRequestHandler):
     server_version = "LominVoiceGateway/1.0"
     protocol_version = "HTTP/1.0"  # no Content-Length on /ask -> EOF ends the stream
@@ -2075,8 +2099,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
     # -- helpers --
 
     def _read_body(self) -> bytes:
-        length = int(self.headers.get("Content-Length", 0) or 0)
+        """Read the request body, refusing a missing-or-bad or oversized
+        Content-Length before reading it (a wedged mic stream must not be able
+        to OOM the gateway). Raises _BodyRejected after sending the error."""
+        raw = self.headers.get("Content-Length", 0) or 0
+        try:
+            length = int(raw)
+        except (TypeError, ValueError):
+            length = -1
+        if length < 0:
+            self._reject_body(400, "bad Content-Length")
+        if length > MAX_BODY_BYTES:
+            self._reject_body(413, f"body too large ({length} > {MAX_BODY_BYTES} bytes)")
         return self.rfile.read(length) if length else b""
+
+    def _reject_body(self, code: int, msg: str) -> None:
+        self.close_connection = True  # the unread body stays on the socket
+        self._send_json(code, {"error": msg})
+        raise _BodyRejected(msg)
 
     def _send_json(self, code: int, obj: dict) -> None:
         body = json.dumps(obj).encode("utf-8")
@@ -2110,6 +2150,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        try:
+            return self._dispatch_post()
+        except _BodyRejected:
+            return
+
+    def _dispatch_post(self):
         path = urlsplit(self.path).path
         if path == "/stt":
             return self._handle_stt()
@@ -2585,7 +2631,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         segmenter = SentenceSegmenter(early_first=FIRST_CLAUSE_EARLY)
         wake = threading.Event()  # set when a sentence is queued or the brain finishes
-        stripped_seen_len = 0
+        spoken_text = ""  # stripped reply text already fed to the segmenter
         lock = threading.Lock()
         futures: list[Future] = []
         executor = ThreadPoolExecutor(max_workers=SENTENCE_CHUNK_MAX_WORKERS)
@@ -2832,16 +2878,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return True
 
         def on_partial(full_raw_text: str) -> None:
-            nonlocal stripped_seen_len
-            full_stripped = strip_markdown(full_raw_text) or ""
-            delta = full_stripped[stripped_seen_len:]
+            nonlocal spoken_text
+            # Strip only the part whose markdown is settled: an unclosed link
+            # or code span would otherwise collapse later and shift offsets.
+            full_stripped = strip_markdown(stable_markdown_prefix(full_raw_text)) or ""
+            delta = unspoken_delta(full_stripped, spoken_text)
             if not delta:
                 return
             if is_silent_sentinel(full_raw_text):
                 # "Pass." would otherwise complete a sentence and be spoken
                 # before the final-reply check can see it is the sentinel.
                 return
-            stripped_seen_len = len(full_stripped)
+            spoken_text = full_stripped
             if timing["brain_first_text_ms"] is None:
                 timing["brain_first_text_ms"] = _ms_since_start()
             for sentence in segmenter.feed(delta):
@@ -2994,7 +3042,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 # boundary for (the tail of the reply text the streamed
                 # on_partial callback couldn't confirm as complete without
                 # more text arriving — see SentenceSegmenter.flush).
-                tail_delta = reply[stripped_seen_len:]
+                tail_delta = unspoken_delta(reply or "", spoken_text)
                 if tail_delta.strip():
                     for sentence in segmenter.feed(tail_delta):
                         _submit(sentence)
