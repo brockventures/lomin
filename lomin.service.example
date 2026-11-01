@@ -1,0 +1,18 @@
+# systemd unit for LÓMIN. Copy to /etc/systemd/system/lomin.service, edit
+# paths and user, then: systemctl daemon-reload && systemctl enable --now lomin
+[Unit]
+Description=LÓMIN voice gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lomin
+WorkingDirectory=/opt/lomin
+EnvironmentFile=/etc/lomin.env
+ExecStart=/usr/bin/python3 gateway.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
