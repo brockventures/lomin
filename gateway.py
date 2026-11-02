@@ -216,6 +216,7 @@ from pending_and_auth import (  # noqa: E402,F401
     get_device_token_verifier,
     get_pending_store,
     has_defer_marker,
+    is_defer_enabled,
     strip_defer_marker,
 )
 
@@ -265,14 +266,12 @@ def _is_ha_authorized(
         return True
     if isinstance(voice_id, dict) and voice_id.get("status") == "verified":
         return True
-    if speaker:
-        return True
 
     # 2. Check bearer token in Authorization header
     if auth_header:
         token = BearerTokenVerifier._extract_token(auth_header)
         if token:
-            if ha_intent_token and hmac.compare_digest(token, ha_intent_token):
+            if ha_intent_token and hmac.compare_digest(token.encode("utf-8"), ha_intent_token.encode("utf-8")):
                 return True
             if device_verifier.is_enabled and device_verifier.verify(auth_header, node_id):
                 return True
@@ -398,14 +397,75 @@ def is_http_stream_enabled() -> bool:
     return bool(HTTP_BRAIN_STREAM) or (os.environ.get("MVG_HTTP_STREAM", "0") == "1")
 
 
+def is_valid_image_bytes(data: bytes) -> bool:
+    """Validate image magic bytes for JPEG, PNG, or WEBP."""
+    if not isinstance(data, (bytes, bytearray)) or len(data) < 3:
+        return False
+    if data[:3] == b"\xff\xd8\xff":
+        return True
+    if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        return True
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return True
+    return False
+
+
 def validate_multimodal_payload(req: dict) -> tuple[int | None, str | None]:
     """Validate type, base64 validity, and max size of multimodal fields.
 
-    Checks image_b64, burst_images_b64, and audio_b64 if present in req.
+    Checks image_b64, burst_images_b64, audio_b64, as well as raw image
+    and burst_images bytes if present in req.
     Returns (status_code, error_message) on failure, or (None, None) if valid.
     """
     if not isinstance(req, dict):
         return 400, "request body must be a JSON object"
+
+    # Raw image inputs: image or image_bytes
+    raw_img = req.get("image") if "image" in req else req.get("image_bytes")
+    if raw_img is not None:
+        if isinstance(raw_img, (bytes, bytearray)):
+            if len(raw_img) > MAX_IMAGE_BYTES:
+                return 413, f"image payload exceeds maximum allowed size ({MAX_IMAGE_BYTES} bytes)"
+            if not is_valid_image_bytes(raw_img):
+                return 400, "image is not a valid image format (must be JPEG, PNG, or WEBP)"
+        elif isinstance(raw_img, str):
+            if len(raw_img) > MAX_IMAGE_B64_BYTES:
+                return 413, f"image payload exceeds maximum allowed size ({MAX_IMAGE_B64_BYTES} bytes)"
+            try:
+                decoded = base64.b64decode(raw_img, validate=True)
+            except Exception:
+                return 400, "image is not valid base64"
+            if len(decoded) > MAX_IMAGE_BYTES:
+                return 413, f"image decoded data exceeds maximum allowed size ({MAX_IMAGE_BYTES} bytes)"
+            if not is_valid_image_bytes(decoded):
+                return 400, "image is not a valid image format (must be JPEG, PNG, or WEBP)"
+        else:
+            return 400, "image must be bytes or string"
+
+    # Raw burst_images list
+    if "burst_images" in req and req["burst_images"] is not None:
+        val = req["burst_images"]
+        if not isinstance(val, list):
+            return 400, "burst_images must be a list"
+        for idx, item in enumerate(val):
+            if isinstance(item, (bytes, bytearray)):
+                if len(item) > MAX_IMAGE_BYTES:
+                    return 413, f"burst_images[{idx}] payload exceeds maximum allowed size ({MAX_IMAGE_BYTES} bytes)"
+                if not is_valid_image_bytes(item):
+                    return 400, f"burst_images[{idx}] is not a valid image format (must be JPEG, PNG, or WEBP)"
+            elif isinstance(item, str):
+                if len(item) > MAX_IMAGE_B64_BYTES:
+                    return 413, f"burst_images[{idx}] payload exceeds maximum allowed size ({MAX_IMAGE_B64_BYTES} bytes)"
+                try:
+                    decoded = base64.b64decode(item, validate=True)
+                except Exception:
+                    return 400, f"burst_images[{idx}] is not valid base64"
+                if len(decoded) > MAX_IMAGE_BYTES:
+                    return 413, f"burst_images[{idx}] decoded data exceeds maximum allowed size ({MAX_IMAGE_BYTES} bytes)"
+                if not is_valid_image_bytes(decoded):
+                    return 400, f"burst_images[{idx}] is not a valid image format (must be JPEG, PNG, or WEBP)"
+            else:
+                return 400, f"burst_images[{idx}] must be bytes or string"
 
     # 1. image_b64
     if "image_b64" in req and req["image_b64"] is not None:
@@ -2593,13 +2653,46 @@ class GatewayHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _get_client_id(self, node_id: str = "") -> str:
+        if hasattr(self, "client_address") and self.client_address and isinstance(self.client_address, (tuple, list)):
+            ip = str(self.client_address[0]).strip()
+            if ip:
+                return ip
+        if hasattr(self, "headers") and self.headers:
+            xff = self.headers.get("X-Forwarded-For")
+            if xff:
+                ip = xff.split(",")[0].strip()
+                if ip:
+                    return ip
+        return node_id or "127.0.0.1"
+
+    def _check_bearer_auth(self, node_id: str = "", endpoint: str = "", t0: float = 0.0) -> bool:
+        verifier = get_device_token_verifier()
+        if not verifier.is_enabled:
+            return True
+        client_id = self._get_client_id(node_id)
+        if verifier.is_locked_out(client_id):
+            self._send_json(429, {"error": "too many failed attempts, locked out"})
+            if t0:
+                log_request(endpoint, (time.time() - t0) * 1000, "error:locked_out", node=node_id)
+            return False
+        auth_header = self.headers.get("Authorization", "")
+        if not verifier.verify(auth_header, node_id):
+            verifier.record_failure(client_id)
+            self._send_json(401, {"error": "unauthorized"})
+            if t0:
+                log_request(endpoint, (time.time() - t0) * 1000, "error:unauthorized", node=node_id)
+            return False
+        verifier.record_success(client_id)
+        return True
+
     # -- routes --
 
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == "/health":
             return self._handle_health()
-        if path == "/voice/pending" and (os.environ.get("MVG_ENABLE_DEFER", "0") == "1"):
+        if path == "/voice/pending" and is_defer_enabled():
             return self._handle_pending_get()
         self._send_json(404, {"error": "not found"})
 
@@ -2635,7 +2728,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return self._handle_speech()
         if path == "/embed":
             return self._handle_embed()
-        if path == "/voice/pending" and (os.environ.get("MVG_ENABLE_DEFER", "0") == "1"):
+        if path == "/voice/pending" and is_defer_enabled():
             return self._handle_pending_post()
         self._send_json(404, {"error": "not found"})
 
@@ -2657,6 +2750,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         qs = parse_qs(parsed.query)
         node = (qs.get("node") or qs.get("node_id") or [""])[0].strip()
+        if not self._check_bearer_auth(node, "/voice/pending", t0):
+            return
         if not node:
             self._send_json(400, {"error": "node parameter required"})
             log_request("/voice/pending", (time.time() - t0) * 1000, "error:no_node")
@@ -2687,6 +2782,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         except Exception:
             req = {}
         node = (req.get("node_id") or req.get("node") or "").strip()
+        if not self._check_bearer_auth(node, "/voice/pending", t0):
+            return
         answer = (req.get("answer") or "").strip()
         prompt = (req.get("prompt") or "").strip()
         topic = (req.get("topic") or "").strip()
@@ -2727,6 +2824,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         elif content_type in ("audio/wav", "application/octet-stream", "") :
             wav_bytes = body
         _set_req_node(node_id)
+        if not self._check_bearer_auth(node_id, "/stt", t0):
+            return
         if not wav_bytes:
             self._send_json(400, {"error": "no audio payload found"})
             log_request("/stt", (time.time() - t0) * 1000, "error:no_audio")
@@ -2772,8 +2871,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         if not node_id:
             qs = parse_qs(parsed.query)
-            node_id = (qs.get("node_id") or [""])[0]
+            node_id = (qs.get("node_id") or [""])[0].strip()
         _set_req_node(node_id)
+        if not self._check_bearer_auth(node_id, "/ambient", t0):
+            return
 
         if not wav_bytes:
             self._send_json(400, {"error": "no audio payload found"})
@@ -2906,6 +3007,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "invalid JSON body"})
             return
 
+        node_id = (req.get("node_id") or self.headers.get("X-Node-Id") or "").strip()
+        if not self._check_bearer_auth(node_id, "/ask", t0):
+            return
+
         err_code, err_msg = validate_multimodal_payload(req)
         if err_code is not None:
             self._send_json(err_code, {"error": err_msg})
@@ -2913,7 +3018,6 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         prompt = req.get("prompt") or ""
         session_id = req.get("session_id") or ""
-        node_id = req.get("node_id") or ""
         speaker = req.get("speaker") or ""
         speaker_score = req.get("speaker_score")
         _set_req_node(node_id)
@@ -2984,6 +3088,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 reply = strip_markdown(raw)
                 if os.environ.get("MVG_ARTIFACT_WEBHOOK_URL"):
                     reply, _ = forward_artifacts_to_webhook(raw, reply)
+                if is_defer_enabled() and (has_defer_marker(raw) or has_defer_marker(reply)):
+                    get_pending_store().store(
+                        node_id=node_id,
+                        prompt=prompt,
+                        answer=strip_defer_marker(reply),
+                    )
                 reply = strip_defer_marker(reply)
                 # Only a real answer opens the follow-up window for /ambient
                 # — the apology isn't a conversational turn worth treating
@@ -3063,6 +3173,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "invalid JSON body"})
             return
 
+        node_id = (req.get("node_id") or self.headers.get("X-Node-Id") or "").strip()
+        if not self._check_bearer_auth(node_id, "/ask/stream", t0):
+            return
+
         err_code, err_msg = validate_multimodal_payload(req)
         if err_code is not None:
             self._send_json(err_code, {"error": err_msg})
@@ -3070,7 +3184,6 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         prompt = req.get("prompt") or ""
         session_id = req.get("session_id") or ""
-        node_id = req.get("node_id") or ""
         speaker = req.get("speaker") or ""
         speaker_score = req.get("speaker_score")
         _set_req_node(node_id)
@@ -3106,6 +3219,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 raise ValueError("body must be an object")
         except Exception:
             self._send_json(400, {"error": "invalid JSON body"})
+            return
+
+        node_id = (req.get("node") or req.get("node_id") or self.headers.get("X-Node-Id") or "").strip()
+        if not self._check_bearer_auth(node_id, "/intent", t0):
             return
         text = req.get("text")
         if not isinstance(text, str) or not text.strip():
@@ -3666,6 +3783,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 reply = strip_markdown(raw)
                 if os.environ.get("MVG_ARTIFACT_WEBHOOK_URL"):
                     reply, _ = forward_artifacts_to_webhook(raw, reply)
+                if is_defer_enabled() and (has_defer_marker(raw) or has_defer_marker(reply)):
+                    get_pending_store().store(
+                        node_id=node_id,
+                        prompt=prompt,
+                        answer=strip_defer_marker(reply),
+                    )
                 reply = strip_defer_marker(reply)
                 # Only a real answer opens the follow-up window for
                 # /ambient — same rule as /ask (see its own comment above).
@@ -3746,20 +3869,6 @@ class GatewayHandler(BaseHTTPRequestHandler):
         elif content_type in ("audio/wav", "application/octet-stream", ""):
             wav_bytes = body
 
-        if enable_adpcm and wav_bytes:
-            try:
-                wav_bytes = decode_adpcm_to_wav(wav_bytes)
-            except ValueError as exc:
-                self._send_json(413, {"error": "payload_too_large", "detail": str(exc)})
-                log_request("/voice/turn", (time.time() - t0) * 1000, "error:adpcm_too_large")
-                return
-
-        if enable_vision and not image_bytes and not burst_images and qs:
-            image_bytes, burst_images = extract_vision_payloads({k: v[0] for k, v in qs.items() if v})
-
-        image_b64 = base64.b64encode(image_bytes).decode("ascii") if image_bytes else None
-        burst_images_b64 = [base64.b64encode(b).decode("ascii") for b in burst_images] if burst_images else []
-
         def opt(name: str):
             """Multipart field first, then the query string; None if absent."""
             if name in fields:
@@ -3783,13 +3892,27 @@ class GatewayHandler(BaseHTTPRequestHandler):
         node_id = forced_node or requested_node
         _set_req_node(node_id)
 
-        verifier = get_device_token_verifier()
-        if verifier.is_enabled:
-            auth_header = self.headers.get("Authorization", "")
-            if not verifier.verify(auth_header, node_id):
-                self._send_json(401, {"error": "unauthorized"})
-                log_request("/voice/turn", (time.time() - t0) * 1000, "error:unauthorized", node=node_id)
+        if not self._check_bearer_auth(node_id, "/voice/turn", t0):
+            return
+
+        if enable_adpcm and wav_bytes:
+            try:
+                wav_bytes = decode_adpcm_to_wav(wav_bytes)
+            except ValueError as exc:
+                self._send_json(413, {"error": "payload_too_large", "detail": str(exc)})
+                log_request("/voice/turn", (time.time() - t0) * 1000, "error:adpcm_too_large", node=node_id)
                 return
+
+        if enable_vision and not image_bytes and not burst_images and qs:
+            image_bytes, burst_images = extract_vision_payloads({k: v[0] for k, v in qs.items() if v})
+
+        if enable_vision and image_bytes and not is_valid_image_bytes(image_bytes):
+            self._send_json(400, {"error": "invalid image format (must be JPEG, PNG, or WEBP)"})
+            log_request("/voice/turn", (time.time() - t0) * 1000, "error:invalid_image", node=node_id)
+            return
+
+        image_b64 = base64.b64encode(image_bytes).decode("ascii") if image_bytes else None
+        burst_images_b64 = [base64.b64encode(b).decode("ascii") for b in burst_images] if burst_images else []
 
         if not node_id:
             self._send_json(400, {"error": "node_id required"})
@@ -4046,6 +4169,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def _handle_embed(self):
         t0 = time.time()
+        node_id = (self.headers.get("X-Node-Id") or
+                   (parse_qs(urlsplit(self.path).query).get("node_id") or [""])[0]).strip()
+        if not self._check_bearer_auth(node_id, "/embed", t0):
+            return
         wav_bytes = self._read_body()
         if not wav_bytes:
             self._send_json(400, {"error": "no audio payload found"})

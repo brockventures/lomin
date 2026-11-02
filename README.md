@@ -258,6 +258,14 @@ Every variable below is also listed, commented, in `.env.example`. Secrets have 
 | `MVG_KOKORO_API_KEY` | unset — bearer token for Kokoro TTS (isolated from `MVG_OPENAI_TTS_KEY`) |
 | `MVG_KOKORO_KEY` | unset — alias for `MVG_KOKORO_API_KEY` |
 | `MVG_MAX_TTS_RESPONSE_BYTES` | `26214400` (25 MiB) — maximum response size cap for TTS backend HTTP responses |
+| `MVG_HA_ENABLED` / `MVG_HA_FASTPATH` | `0` — `1` enables Home Assistant conversation intent fast-path |
+| `MVG_HA_URL` | unset — Home Assistant base URL (e.g. `http://homeassistant.local:8123`) for `/api/conversation/process` |
+| `MVG_HA_TOKEN` | unset — long-lived access token for Home Assistant REST API |
+| `MVG_HA_INTENT_TOKEN` | unset — bearer token required for executing `/intent` actions via Home Assistant |
+| `MVG_ENABLE_DEFER` | `0` — `1` enables asynchronous deferred voice answer store (`[[defer]]` marker detection and `/voice/pending` endpoints) |
+| `MVG_DEVICE_TOKENS` | unset — per-device or shared bearer tokens (`node1:tok1,node2:tok2[,shared_token]`) enforced across all API endpoints |
+| `MVG_AUTH_MAX_FAILURES` | `5` — maximum consecutive failed bearer auth attempts per client IP before lockout |
+| `MVG_AUTH_LOCKOUT_SEC` | `60.0` — lockout duration in seconds after max failed auth attempts (returns 429 Too Many Requests) |
 
 ## Endpoints
 
@@ -1038,11 +1046,46 @@ Lomin supports non-blocking side-channel notifications, turn transcript streamin
 
 ### Side-Channel Artifact Webhooks (`MVG_ARTIFACT_WEBHOOK_URL`)
 - When configured, raw replies are checked for URLs (`https?://...`) and Markdown code blocks (```` ```...``` ````).
-- If artifacts are detected, the spoken reply is augmented with a verbal cue ("*I sent the link to Discord.*") unless already cued.
-- The full artifact payload is queued to a bounded background daemon worker queue (`MVG_SIDE_CHANNEL_QUEUE_SIZE`, default 1000) and dispatched asynchronously via HTTP/HTTPS POST, ensuring slow or unreachable webhooks never add latency to speech synthesis or playback.
+- If artifacts are detected, the spoken reply is augmented with a verbal cue ("*Sending the link to Discord.*") unless already cued.
+- The raw reply is sent whole to the side-channel webhook payload without markdown stripping, so formatting, links, and code blocks are preserved intact in the destination channel.
+- The webhook payload is dispatched via a dedicated background worker queue independent of transcript logging (`MVG_SIDE_CHANNEL_QUEUE_SIZE`, default 1000), ensuring slow or unreachable webhooks never block speech synthesis or drop transcript events.
 
 ### Turn Transcripts (`MVG_TRANSCRIPT_SINK_URL` and `MVG_TRANSCRIPT_LOG_PATH`)
-- Turn records (including prompt, spoken reply, timing metrics, and node ID) are exported asynchronously via background worker queue.
+- Turn records (including prompt, spoken reply, timing metrics, and node ID) are exported asynchronously via a dedicated background worker queue.
 - **HTTP/HTTPS Sink (`MVG_TRANSCRIPT_SINK_URL`):** Dispatches JSON turn records. Validates URL schemes (only `http` and `https` permitted) and blocks insecure cross-scheme redirect downgrades. Supports optional bearer authorization via `MVG_TRANSCRIPT_AUTH_TOKEN`.
 - **JSONL File Sink (`MVG_TRANSCRIPT_LOG_PATH`):** Appends turn records to a local JSONL file with strict `0o600` permissions (`-rw-------`). Automatically rotates the active log file to `.1` when size exceeds `MVG_TRANSCRIPT_MAX_BYTES` (default 10 MiB).
+
+## Home Assistant Conversation Fast-Path & Authorization
+
+When `MVG_HA_ENABLED=1` (or `MVG_HA_FASTPATH=1`), Lomin consults Home Assistant's `/api/conversation/process` before falling through to the brain.
+
+- **Fast-Path Matching:** Natural-language control commands (e.g., turning on lights, running scripts, setting thermostats) match HA intents deterministically. Matched intents return immediately with `intent: "ha_conversation"` and the spoken confirmation text.
+- **Security & Authorization:**
+  - When `MVG_HA_INTENT_TOKEN` or `MVG_DEVICE_TOKENS` is configured, calls to `/intent` require authorization.
+  - Authorization requires either a valid Bearer token (`Authorization: Bearer <token>`) matching `MVG_HA_INTENT_TOKEN` / device verifier, or a verified speaker identity via trusted gateway headers (`X-Voice-Claimed-Speaker` validated with `MVG_TRUSTED_KEY`) or biometric voice ID (`voice_id.status == "verified"`).
+  - Unauthenticated requests passing an arbitrary `{"speaker": "..."}` JSON field are strictly rejected with HTTP 401 Unauthorized; the speaker field alone never bypasses authorization.
+- **Circuit Breaker:** Consecutive timeouts or upstream network errors trigger an automated circuit breaker cooldown, failing fast to the brain to prevent turn stalls.
+
+## Per-Device Bearer Auth & Deferred Async Voice Answers
+
+### Endpoint Bearer Authentication (`MVG_DEVICE_TOKENS`)
+
+When `MVG_DEVICE_TOKENS` is configured, Lomin enforces Bearer token authentication across all API endpoints:
+- **Protected Endpoints:** `/voice/pending` (GET & POST), `/voice/turn`, `/ask`, `/ask/stream`, `/stt`, `/embed`, `/ambient`, and `/intent`.
+- **Configuration Format:** Comma-separated per-device tokens and optional shared fallback:
+  `MVG_DEVICE_TOKENS="node1:tok1,node2:tok2,shared_fallback"`
+- **Lockout & Rate Limiting:**
+  - Failed authentication attempts are tracked per client IP address.
+  - After `MVG_AUTH_MAX_FAILURES` (default 5) consecutive failures within `MVG_AUTH_LOCKOUT_SEC` (default 60s), subsequent requests are immediately rejected with HTTP 429 Too Many Requests until the lockout window expires.
+  - Successful authentication clears the failure history for the client.
+
+### Deferred Voice Answers (`MVG_ENABLE_DEFER`)
+
+When `MVG_ENABLE_DEFER=1`, the gateway supports deferred asynchronous voice replies:
+- **Marker Detection:** Replies containing `[[defer]]` markers indicate long-running or asynchronous task results.
+- **Marker Stripping:** The marker is stripped from spoken audio replies (`strip_defer_marker`) so it is never synthesized into TTS speech.
+- **Pending Store:** The pending answer is stored in a thread-safe, memory-bounded store (`PendingVoiceAnswerStore`) indexed by node ID.
+- **Client Retrieval (`/voice/pending`):**
+  - `GET /voice/pending?node=<node>&pop=1`: Retrieves and pops the oldest pending answer for the node.
+  - `POST /voice/pending`: Stores an asynchronous answer directly into the pending queue for subsequent voice delivery.
 
