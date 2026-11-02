@@ -407,7 +407,7 @@ def test_get_backend_kwargs_forwarding():
 
 
 def test_get_backend_env_resolution(monkeypatch):
-    """get_backend() without args resolves from MVG_TTS env var, defaulting to kokoro."""
+    """get_backend() without args resolves from MVG_TTS env var, defaulting to None (off)."""
     monkeypatch.setenv("MVG_TTS", "gemini")
     b = get_backend()
     assert isinstance(b, GeminiTTSBackend)
@@ -418,7 +418,19 @@ def test_get_backend_env_resolution(monkeypatch):
 
     monkeypatch.delenv("MVG_TTS", raising=False)
     b = get_backend()
-    assert isinstance(b, KokoroTTSBackend)
+    assert b is None
+
+    monkeypatch.setenv("MVG_TTS", "")
+    assert get_backend() is None
+
+    monkeypatch.setenv("MVG_TTS", "   ")
+    assert get_backend() is None
+
+    monkeypatch.setenv("MVG_TTS", "off")
+    assert get_backend() is None
+
+    monkeypatch.setenv("MVG_TTS", "none")
+    assert get_backend() is None
 
 
 def test_get_backend_unknown_raises():
@@ -507,3 +519,116 @@ def test_callable_interface(monkeypatch):
     )
     backend = KokoroTTSBackend()
     assert backend("Callable test") == test_pcm
+
+
+# ---------------------------------------------------------------------------
+# Security & Invariant Tests (Review Fixes: Auth Isolation, Caps, Gateway Chain)
+# ---------------------------------------------------------------------------
+
+
+def test_kokoro_api_key_isolation_never_uses_openai_key(monkeypatch):
+    """KokoroTTSBackend must NEVER fall back to MVG_OPENAI_TTS_KEY."""
+    captured = {}
+    test_pcm = _make_dummy_pcm(200)
+
+    def mock_urlopen(req, timeout=None):
+        captured["req"] = req
+        return _MockHTTPResponse(test_pcm, status=200)
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+    monkeypatch.delenv("MVG_KOKORO_API_KEY", raising=False)
+    monkeypatch.delenv("MVG_KOKORO_KEY", raising=False)
+    monkeypatch.setenv("MVG_OPENAI_TTS_KEY", "openai-secret-token")
+
+    backend = KokoroTTSBackend()
+    assert backend.api_key == ""
+    backend.synthesize("Hello isolation")
+    assert "Authorization" not in captured["req"].headers
+
+    # Now verify MVG_KOKORO_KEY alias works
+    monkeypatch.setenv("MVG_KOKORO_KEY", "kokoro-alias-key")
+    backend2 = KokoroTTSBackend()
+    assert backend2.api_key == "kokoro-alias-key"
+    backend2.synthesize("Hello with alias key")
+    assert captured["req"].get_header("Authorization") == "Bearer kokoro-alias-key"
+
+    # MVG_KOKORO_API_KEY takes priority
+    monkeypatch.setenv("MVG_KOKORO_API_KEY", "kokoro-primary-key")
+    backend3 = KokoroTTSBackend()
+    assert backend3.api_key == "kokoro-primary-key"
+    backend3.synthesize("Hello with primary key")
+    assert captured["req"].get_header("Authorization") == "Bearer kokoro-primary-key"
+
+
+def test_gemini_response_size_cap(monkeypatch):
+    """GeminiTTSBackend.synthesize raises RuntimeError when response exceeds MAX_TTS_RESPONSE_BYTES."""
+    monkeypatch.setattr(tts_backends, "MAX_TTS_RESPONSE_BYTES", 100)
+    oversized_body = b"x" * 150
+
+    def mock_urlopen(req, timeout=None):
+        return _MockHTTPResponse(oversized_body, status=200)
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+    backend = GeminiTTSBackend(api_key="mock-key")
+    with pytest.raises(RuntimeError, match="gemini tts response exceeded maximum size"):
+        backend.synthesize("Too large")
+
+
+def test_kokoro_response_size_cap_synthesize(monkeypatch):
+    """KokoroTTSBackend.synthesize raises RuntimeError when response exceeds MAX_TTS_RESPONSE_BYTES."""
+    monkeypatch.setattr(tts_backends, "MAX_TTS_RESPONSE_BYTES", 100)
+    oversized_body = b"y" * 150
+
+    def mock_urlopen(req, timeout=None):
+        return _MockHTTPResponse(oversized_body, status=200)
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+    backend = KokoroTTSBackend()
+    with pytest.raises(RuntimeError, match="kokoro tts response exceeded maximum size"):
+        backend.synthesize("Too large")
+
+
+def test_kokoro_response_size_cap_synthesize_stream(monkeypatch):
+    """KokoroTTSBackend.synthesize_stream raises RuntimeError when total read exceeds MAX_TTS_RESPONSE_BYTES."""
+    monkeypatch.setattr(tts_backends, "MAX_TTS_RESPONSE_BYTES", 100)
+    oversized_body = b"z" * 150
+
+    def mock_urlopen(req, timeout=None):
+        return _MockHTTPResponse(oversized_body, status=200)
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+    backend = KokoroTTSBackend()
+    with pytest.raises(RuntimeError, match="kokoro tts response exceeded maximum size"):
+        list(backend.synthesize_stream("Too large", chunk_size=32))
+
+
+def test_gateway_tts_backends_registration(monkeypatch):
+    """'gemini' and 'kokoro' must be registered in gateway.TTS_BACKENDS and usable via synthesize()."""
+    import gateway
+
+    assert "gemini" in gateway.TTS_BACKENDS
+    assert "kokoro" in gateway.TTS_BACKENDS
+    assert callable(gateway.TTS_BACKENDS["gemini"])
+    assert callable(gateway.TTS_BACKENDS["kokoro"])
+
+    dummy_pcm = _make_dummy_pcm(200)
+    dummy_wav = _make_wav_from_pcm(dummy_pcm, sample_rate=24000)
+
+    # Test synthesizing via gemini backend
+    monkeypatch.setattr(tts_backends, "gemini_speak", lambda text: dummy_wav)
+    monkeypatch.setattr(gateway, "TTS_CHAIN", ["gemini"])
+    wav, engine = gateway.synthesize("Test gemini chain")
+    assert wav == dummy_wav
+    assert engine == "gemini"
+
+    # Test synthesizing via kokoro backend
+    monkeypatch.setattr(tts_backends, "kokoro_speak", lambda text: dummy_wav)
+    monkeypatch.setattr(gateway, "TTS_CHAIN", ["kokoro"])
+    wav, engine = gateway.synthesize("Test kokoro chain")
+    assert wav == dummy_wav
+    assert engine == "kokoro"
+
+    # Test _tts_chain_from_env parses gemini and kokoro
+    monkeypatch.setenv("MVG_TTS_CHAIN", "gemini,kokoro")
+    chain = gateway._tts_chain_from_env()
+    assert chain == ["gemini", "kokoro"]

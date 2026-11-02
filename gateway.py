@@ -2292,9 +2292,11 @@ def _desktop_backend(text: str) -> bytes:
 TTS_BACKENDS = {
     "desktop": _desktop_backend,
     "piper": lambda text: piper_speak(text),
-    "elevenlabs": tts_backends.elevenlabs_speak,
-    "openai": tts_backends.openai_speech_speak,
-    "http": tts_backends.http_tts_speak,
+    "elevenlabs": lambda text: tts_backends.elevenlabs_speak(text),
+    "openai": lambda text: tts_backends.openai_speech_speak(text),
+    "http": lambda text: tts_backends.http_tts_speak(text),
+    "gemini": lambda text: tts_backends.gemini_speak(text),
+    "kokoro": lambda text: tts_backends.kokoro_speak(text),
 }
 # Reason labels for the fallback log. "desktop-tts" is the label this chain
 # has always logged; every other entry is its own name.

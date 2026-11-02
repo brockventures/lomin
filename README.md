@@ -104,6 +104,8 @@ reasons.
 | `elevenlabs` | ElevenLabs text-to-speech, WAV at 24 kHz, 10 s timeout | `ELEVENLABS_API_KEY`, `MVG_ELEVENLABS_VOICE_ID`, `MVG_ELEVENLABS_MODEL` |
 | `openai` | any OpenAI-compatible `/v1/audio/speech`, 15 s timeout | `MVG_OPENAI_TTS_URL`, `MVG_OPENAI_TTS_MODEL`, `MVG_OPENAI_TTS_VOICE`, `MVG_OPENAI_TTS_KEY` |
 | `http` | generic hook: POST `{"text": ...}`, the body is the WAV, 15 s timeout | `MVG_HTTP_TTS_URL` |
+| `gemini` | Gemini TTS API, 24 kHz mono PCM wrapped in WAV, 15 s timeout | `MVG_GEMINI_API_KEY` (or `GEMINI_API_KEY`), `MVG_GEMINI_VOICE`, `MVG_GEMINI_TTS_MODEL`, `MVG_GEMINI_TTS_URL` |
+| `kokoro` | Kokoro TTS endpoint, 24 kHz mono PCM wrapped in WAV, 15 s timeout | `MVG_KOKORO_URL`, `MVG_KOKORO_VOICE`, `MVG_KOKORO_MODEL`, `MVG_KOKORO_API_KEY` (or `MVG_KOKORO_KEY`) |
 
 Example: Kokoro-FastAPI serves an OpenAI-compatible endpoint at
 `http://localhost:8880/v1/audio/speech`. To speak with it and fall back to
@@ -114,6 +116,23 @@ MVG_TTS_CHAIN=openai,piper
 MVG_OPENAI_TTS_URL=http://localhost:8880/v1/audio/speech
 MVG_OPENAI_TTS_MODEL=kokoro
 MVG_OPENAI_TTS_VOICE=af_sky
+```
+
+Example: Gemini TTS using the official Gemini audio generation API (`x-goog-api-key` header auth), falling back to Piper:
+
+```
+MVG_TTS_CHAIN=gemini,piper
+MVG_GEMINI_API_KEY=your-gemini-key
+MVG_GEMINI_VOICE=Schedar
+```
+
+Example: Dedicated Kokoro TTS endpoint (`/v1/audio/speech`), falling back to Piper:
+
+```
+MVG_TTS_CHAIN=kokoro,piper
+MVG_KOKORO_URL=http://localhost:8880/v1/audio/speech
+MVG_KOKORO_VOICE=af_heart
+MVG_KOKORO_API_KEY=optional-bearer-key
 ```
 
 **Speaker ID.** `MVG_SPEAKER_ID=0` turns speaker identification off on every
@@ -221,6 +240,17 @@ Every variable below is also listed, commented, in `.env.example`. Secrets have 
 | `MVG_OPENAI_TTS_VOICE` | `af_sky` |
 | `MVG_OPENAI_TTS_KEY` | unset — bearer token sent to the `openai` endpoint, only when set |
 | `MVG_HTTP_TTS_URL` | unset — generic `http` backend: POST `{"text": ...}`, the response body is the WAV (required for it) |
+| `MVG_TTS` | unset — opt-in TTS backend selector (`gemini`, `kokoro`); returns `None`/off when unset |
+| `MVG_GEMINI_API_KEY` | unset — API key for `gemini` TTS backend (passed via `x-goog-api-key` header, falls back to `GEMINI_API_KEY`) |
+| `MVG_GEMINI_VOICE` | `Schedar` — default voice for Gemini TTS |
+| `MVG_GEMINI_TTS_MODEL` | `gemini-2.5-flash-preview-tts` — model for Gemini TTS |
+| `MVG_GEMINI_TTS_URL` | unset — custom endpoint URL for Gemini TTS |
+| `MVG_KOKORO_URL` | `http://127.0.0.1:8880/v1/audio/speech` — Kokoro TTS endpoint URL |
+| `MVG_KOKORO_VOICE` | `af_heart` — default voice for Kokoro TTS |
+| `MVG_KOKORO_MODEL` | `kokoro` — default model for Kokoro TTS |
+| `MVG_KOKORO_API_KEY` | unset — bearer token for Kokoro TTS (isolated from `MVG_OPENAI_TTS_KEY`) |
+| `MVG_KOKORO_KEY` | unset — alias for `MVG_KOKORO_API_KEY` |
+| `MVG_MAX_TTS_RESPONSE_BYTES` | `26214400` (25 MiB) — maximum response size cap for TTS backend HTTP responses |
 
 ## Endpoints
 
