@@ -1,17 +1,23 @@
 """Multimodal camera & BLE IMA ADPCM ingest for Lomin Agent Voice Gateway.
 
-Stdlib only (struct, base64, os).
-Gated behind MVG_ENABLE_VISION and MVG_ENABLE_ADPCM.
+Stdlib only (struct, base64, array, os).
+Gated behind MVG_ENABLE_VISION (or MVG_VISION_ENABLED / MVG_VISION_ADPCM)
+and MVG_ENABLE_ADPCM (or MVG_ADPCM_ENABLED / MVG_VISION_ADPCM).
 """
 
 from __future__ import annotations
 
+import array
 import base64
 import struct
+import sys
 from typing import Optional, Tuple
 
 ADPCM_MAGIC = b"APCM"
 ADPCM_HEADER_SIZE = 16  # <4sIIhBB: magic (4s), sample_rate (u32), num_samples (u32), predictor (i16), step_index (u8), reserved (u8)
+MAX_ADPCM_BYTES = 512 * 1024  # 512 KiB strict upload cap
+MAX_IMAGE_B64_BYTES = 5 * 1024 * 1024  # 5 MiB base64 payload cap
+MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5 MiB decoded image bytes cap
 
 IMA_INDEX_TABLE: Tuple[int, ...] = (
     -1, -1, -1, -1, 2, 4, 6, 8,
@@ -155,32 +161,42 @@ def decode_ima_adpcm(
     initial_predictor: int = 0,
     initial_step_index: int = 0,
 ) -> bytes:
-    """Decompress 4-bit IMA ADPCM nibbles back into 16-bit signed little-endian mono PCM."""
+    """Decompress 4-bit IMA ADPCM nibbles back into 16-bit signed little-endian mono PCM.
+
+    Uses array.array('h') to avoid allocating millions of boxed Python int objects.
+    """
     if not adpcm_bytes:
         return b""
+    if len(adpcm_bytes) > MAX_ADPCM_BYTES:
+        raise ValueError(
+            f"IMA ADPCM payload size {len(adpcm_bytes)} exceeds MAX_ADPCM_BYTES ({MAX_ADPCM_BYTES})"
+        )
+
     total_nibbles = len(adpcm_bytes) * 2
     target_samples = total_nibbles if num_samples is None else min(max(0, int(num_samples)), total_nibbles)
     if target_samples <= 0:
         return b""
 
-    out_samples: list[int] = []
+    out = array.array("h")
     predictor = max(-32768, min(32767, int(initial_predictor)))
     step_index = max(0, min(88, int(initial_step_index)))
 
     for byte_val in adpcm_bytes:
         nib_lo = byte_val & 0x0F
         predictor, step_index = _decode_ima_nibble(nib_lo, predictor, step_index)
-        out_samples.append(predictor)
-        if len(out_samples) >= target_samples:
+        out.append(predictor)
+        if len(out) >= target_samples:
             break
 
         nib_hi = (byte_val >> 4) & 0x0F
         predictor, step_index = _decode_ima_nibble(nib_hi, predictor, step_index)
-        out_samples.append(predictor)
-        if len(out_samples) >= target_samples:
+        out.append(predictor)
+        if len(out) >= target_samples:
             break
 
-    return struct.pack(f"<{len(out_samples)}h", *out_samples)
+    if sys.byteorder != "little":
+        out.byteswap()
+    return out.tobytes()
 
 
 def _wrap_pcm_in_wav(pcm_bytes: bytes, sample_rate: int = 16000) -> bytes:
@@ -263,9 +279,15 @@ def decode_adpcm_to_wav(data: bytes, sample_rate: int = 16000) -> bytes:
     """Decode an APCM 4-bit IMA ADPCM container into a 16-bit mono PCM RIFF WAV buffer.
 
     If data does not start with ADPCM_MAGIC (b'APCM'), returns data unchanged.
+    Enforces MAX_ADPCM_BYTES upload cap, raising ValueError if exceeded.
     """
     if not data or len(data) < 4 or data[:4] != ADPCM_MAGIC:
         return data
+
+    if len(data) > MAX_ADPCM_BYTES:
+        raise ValueError(
+            f"ADPCM data size {len(data)} exceeds maximum allowed {MAX_ADPCM_BYTES} bytes"
+        )
 
     sr = sample_rate
     num_samples: Optional[int] = None
@@ -315,6 +337,9 @@ def extract_vision_payloads(parts_or_json: dict) -> Tuple[Optional[bytes], list[
     Returns (image_bytes, burst_images).
     image_bytes is bytes or None.
     burst_images is a list of bytes (up to 5 frames).
+
+    Validates base64 strings and enforces MAX_IMAGE_B64_BYTES / MAX_IMAGE_BYTES.
+    Non-base64 text and invalid types are strictly rejected (return None / skipped).
     """
     if not isinstance(parts_or_json, dict):
         return None, []
@@ -327,22 +352,29 @@ def extract_vision_payloads(parts_or_json: dict) -> Tuple[Optional[bytes], list[
             if not b:
                 return None
             if is_b64_hint:
+                if len(b) > MAX_IMAGE_B64_BYTES:
+                    return None
                 try:
-                    return base64.b64decode(b, validate=True)
+                    decoded = base64.b64decode(b, validate=True)
+                    if decoded and len(decoded) <= MAX_IMAGE_BYTES:
+                        return decoded
                 except Exception:
-                    pass
+                    return None
+                return None
+            if len(b) > MAX_IMAGE_BYTES:
+                return None
             return b
         if isinstance(val, str):
             s = val.strip()
-            if not s:
+            if not s or len(s) > MAX_IMAGE_B64_BYTES:
                 return None
             try:
                 decoded = base64.b64decode(s, validate=True)
-                if decoded:
+                if decoded and len(decoded) <= MAX_IMAGE_BYTES:
                     return decoded
             except Exception:
-                pass
-            return s.encode("utf-8")
+                return None
+            return None
         return None
 
     # Single image extraction: check 'image', then 'image_b64'
@@ -367,24 +399,19 @@ def extract_vision_payloads(parts_or_json: dict) -> Tuple[Optional[bytes], list[
         raw_list = parts_or_json["burst_images_b64"]
         if isinstance(raw_list, list):
             for item in raw_list[:5]:
-                b = _to_bytes(item, is_b64_hint=True)
-                if b:
-                    burst_images.append(b)
+                if isinstance(item, (str, bytes, bytearray)):
+                    b = _to_bytes(item, is_b64_hint=True)
+                    if b:
+                        burst_images.append(b)
 
     # 3. burst_images list
     if not burst_images and "burst_images" in parts_or_json:
         raw_list = parts_or_json["burst_images"]
         if isinstance(raw_list, list):
             for item in raw_list[:5]:
-                b = _to_bytes(item)
-                if b:
-                    burst_images.append(b)
+                if isinstance(item, (str, bytes, bytearray)):
+                    b = _to_bytes(item)
+                    if b:
+                        burst_images.append(b)
 
     return image_bytes, burst_images
-
-
-def build_vision_filler(burst_count: int = 0) -> str:
-    """Build a natural conversational filler phrase for camera / burst inputs."""
-    if burst_count > 1:
-        return f"Taking a look at those {burst_count} photos..."
-    return "Taking a look..."

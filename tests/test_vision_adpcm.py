@@ -16,7 +16,8 @@ import pytest
 import gateway
 from vision_adpcm import (
     ADPCM_MAGIC,
-    build_vision_filler,
+    MAX_ADPCM_BYTES,
+    MAX_IMAGE_B64_BYTES,
     decode_adpcm_to_wav,
     decode_ima_adpcm,
     encode_adpcm,
@@ -239,11 +240,41 @@ def test_extract_vision_payloads_combined_single_and_burst():
     assert burst == [burst0, burst1]
 
 
-def test_build_vision_filler():
-    assert build_vision_filler(0) == "Taking a look..."
-    assert build_vision_filler(1) == "Taking a look..."
-    assert build_vision_filler(2) == "Taking a look at those 2 photos..."
-    assert build_vision_filler(5) == "Taking a look at those 5 photos..."
+def test_decode_adpcm_size_cap():
+    oversized = ADPCM_MAGIC + b"\x00" * (MAX_ADPCM_BYTES + 1)
+    with pytest.raises(ValueError, match="exceeds"):
+        decode_adpcm_to_wav(oversized)
+
+    with pytest.raises(ValueError, match="exceeds"):
+        decode_ima_adpcm(b"\x00" * (MAX_ADPCM_BYTES + 1))
+
+
+def test_extract_vision_payloads_validation():
+    # Non-base64 text strings must be rejected
+    img, burst = extract_vision_payloads({"image": "not-valid-base64-text!"})
+    assert img is None
+    assert burst == []
+
+    img, burst = extract_vision_payloads({"image_b64": "invalid base64 ???"})
+    assert img is None
+    assert burst == []
+
+    # Oversized base64 string must be rejected
+    oversized_str = "A" * (MAX_IMAGE_B64_BYTES + 10)
+    img, burst = extract_vision_payloads({"image_b64": oversized_str})
+    assert img is None
+    assert burst == []
+
+    # burst_images_b64 must be a list
+    img, burst = extract_vision_payloads({"burst_images_b64": "not-a-list"})
+    assert img is None
+    assert burst == []
+
+    # burst_images_b64 filters out non-string and non-base64 items
+    valid_b64 = base64.b64encode(b"frame1").decode("ascii")
+    img, burst = extract_vision_payloads({"burst_images_b64": [valid_b64, "invalid_b64!", 12345]})
+    assert img is None
+    assert burst == [b"frame1"]
 
 
 # ============================================================================

@@ -163,6 +163,7 @@ import collections
 import hashlib
 import hmac
 import importlib
+import inspect
 import json
 import math
 import os
@@ -197,7 +198,6 @@ from audio_utils import (  # noqa: E402,F401
 )
 from vision_adpcm import (  # noqa: E402,F401
     ADPCM_MAGIC,
-    build_vision_filler,
     decode_adpcm_to_wav,
     extract_vision_payloads,
 )
@@ -306,8 +306,32 @@ CLASSIFY_KEY = os.environ.get("MVG_CLASSIFY_KEY", "lomin.ambient")
 LOG_NAME = os.environ.get("MVG_LOG_NAME", "lomin.jsonl")
 
 # Multimodal camera & BLE IMA ADPCM ingest flags (Chunk 1 parity)
-ENABLE_VISION = os.environ.get("MVG_ENABLE_VISION", "0") == "1"
-ENABLE_ADPCM = os.environ.get("MVG_ENABLE_ADPCM", "0") == "1"
+ENABLE_VISION = (
+    os.environ.get("MVG_ENABLE_VISION", "0") == "1"
+    or os.environ.get("MVG_VISION_ENABLED", "0") == "1"
+    or os.environ.get("MVG_VISION_ADPCM", "0") == "1"
+)
+ENABLE_ADPCM = (
+    os.environ.get("MVG_ENABLE_ADPCM", "0") == "1"
+    or os.environ.get("MVG_ADPCM_ENABLED", "0") == "1"
+    or os.environ.get("MVG_VISION_ADPCM", "0") == "1"
+)
+
+
+def is_vision_enabled() -> bool:
+    return bool(ENABLE_VISION) or (
+        os.environ.get("MVG_ENABLE_VISION", "0") == "1"
+        or os.environ.get("MVG_VISION_ENABLED", "0") == "1"
+        or os.environ.get("MVG_VISION_ADPCM", "0") == "1"
+    )
+
+
+def is_adpcm_enabled() -> bool:
+    return bool(ENABLE_ADPCM) or (
+        os.environ.get("MVG_ENABLE_ADPCM", "0") == "1"
+        or os.environ.get("MVG_ADPCM_ENABLED", "0") == "1"
+        or os.environ.get("MVG_VISION_ADPCM", "0") == "1"
+    )
 
 # Streaming SSE HTTP brain & direct-audio flags (Chunk 2 parity)
 HTTP_BRAIN_STREAM = os.environ.get("MVG_HTTP_STREAM", "0") == "1"
@@ -1860,7 +1884,7 @@ def http_brain_call(prompt: str, session_id: str, node_id: str, speaker: str,
         "node_id": node_id,
         "target": _call_target(node_id),
     }
-    enable_vision = bool(ENABLE_VISION) or (os.environ.get("MVG_ENABLE_VISION", "0") == "1")
+    enable_vision = is_vision_enabled()
     if enable_vision:
         ctx = getattr(_FRAME_CTX, "ctx", None) or {}
         img = image_b64 or ctx.get("image_b64")
@@ -1909,7 +1933,7 @@ def http_brain_call_stream(prompt: str, session_id: str, node_id: str, speaker: 
         "node_id": node_id,
         "target": _call_target(node_id),
     }
-    enable_vision = bool(ENABLE_VISION) or (os.environ.get("MVG_ENABLE_VISION", "0") == "1")
+    enable_vision = is_vision_enabled()
     if enable_vision:
         ctx = getattr(_FRAME_CTX, "ctx", None) or {}
         img = image_b64 or ctx.get("image_b64")
@@ -3275,7 +3299,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 if fast["intent"]:  # matched but the handler failed: still a brain turn
                     intent_rec["intent_fallthrough"] = f"{fast['intent']}:{fast['reason']}"
                 call_kwargs = {}
-                enable_vision = bool(ENABLE_VISION) or (os.environ.get("MVG_ENABLE_VISION", "0") == "1")
+                enable_vision = is_vision_enabled()
                 if enable_vision:
                     if ctx.get("image_b64"):
                         call_kwargs["image_b64"] = ctx["image_b64"]
@@ -3285,16 +3309,22 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 if brain_direct_audio:
                     if ctx.get("audio_b64"):
                         call_kwargs["audio_b64"] = ctx["audio_b64"]
+                # Upfront inspect.signature check prevents TypeError retries from double-sending prompts
                 try:
-                    result_box["reply"] = STREAM_BRAIN_CALL(
-                        prompt, session_id, node_id, speaker, speaker_score,
-                        HIVE_TIMEOUT, on_partial, **call_kwargs,
-                    )
-                except TypeError:
-                    result_box["reply"] = STREAM_BRAIN_CALL(
-                        prompt, session_id, node_id, speaker, speaker_score,
-                        HIVE_TIMEOUT, on_partial,
-                    )
+                    sig = inspect.signature(STREAM_BRAIN_CALL)
+                    params = sig.parameters
+                    has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+                    filtered_kwargs = {
+                        k: v for k, v in call_kwargs.items()
+                        if has_var_keyword or k in params
+                    }
+                except (ValueError, TypeError):
+                    filtered_kwargs = {}
+
+                result_box["reply"] = STREAM_BRAIN_CALL(
+                    prompt, session_id, node_id, speaker, speaker_score,
+                    HIVE_TIMEOUT, on_partial, **filtered_kwargs,
+                )
             except Exception as exc:
                 result_box["error"] = str(exc)
             finally:
@@ -3474,8 +3504,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         image_bytes: bytes | None = None
         burst_images: list[bytes] = []
 
-        enable_adpcm = bool(ENABLE_ADPCM) or (os.environ.get("MVG_ENABLE_ADPCM", "0") == "1")
-        enable_vision = bool(ENABLE_VISION) or (os.environ.get("MVG_ENABLE_VISION", "0") == "1")
+        enable_adpcm = is_adpcm_enabled()
+        enable_vision = is_vision_enabled()
 
         if content_type.startswith("multipart/form-data"):
             parts = parse_multipart_parts(body, content_type)
@@ -3489,7 +3519,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
             wav_bytes = body
 
         if enable_adpcm and wav_bytes:
-            wav_bytes = decode_adpcm_to_wav(wav_bytes)
+            try:
+                wav_bytes = decode_adpcm_to_wav(wav_bytes)
+            except ValueError as exc:
+                self._send_json(413, {"error": "payload_too_large", "detail": str(exc)})
+                log_request("/voice/turn", (time.time() - t0) * 1000, "error:adpcm_too_large")
+                return
 
         if enable_vision and not image_bytes and not burst_images and qs:
             image_bytes, burst_images = extract_vision_payloads({k: v[0] for k, v in qs.items() if v})

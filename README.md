@@ -130,6 +130,9 @@ Every variable below is also listed, commented, in `.env.example`. Secrets have 
 | Var | Default |
 |---|---|
 | `MVG_HOME` | `~/.mvg` — state root: watch tokens, piper config and binaries, voice capture, speakers, the desktop TTS voice clip |
+| `MVG_ENABLE_VISION` / `MVG_VISION_ENABLED` | `0` — `1` enables multimodal camera frame ingest (`image`, `image_b64`, `burst_images_b64`, max 5 MiB) on `/voice/turn` |
+| `MVG_ENABLE_ADPCM` / `MVG_ADPCM_ENABLED` | `0` — `1` enables BLE 4-bit IMA ADPCM audio decode (`APCM` header -> 16 kHz PCM WAV, max 512 KiB) on `/voice/turn` |
+| `MVG_VISION_ADPCM` | `0` — `1` convenience alias enabling both vision frames and ADPCM decode |
 | `MVG_PLUGIN` | unset — module name of the plugin (see "Plugin") |
 | `MVG_BRAIN` | `plugin` when the plugin has `brain_call`, else `http` — `plugin` or `http` |
 | `MVG_BRAIN_URL` | unset (required for `http`) — endpoint the `http` brain POSTs to |
@@ -781,6 +784,12 @@ fields, or a raw WAV body with the same flags in the query string.
 | `audio_chunk` | also emit hub-dialect `audio_chunk` events (default: profile) |
 | `device` | optional; what the speaker is using, e.g. `iphone`, `watch`. Header `X-Voice-Device` is the fallback |
 | `medium` | optional; how they reach the agent, e.g. `phone-app`, `watch-app`, `room-speaker`, `chat-voice`. Header `X-Voice-Medium` is the fallback |
+| `image` / `image_b64` | optional; JPEG camera frame (binary in multipart `image`, or base64 string up to 5 MiB in `image_b64`), gated by `MVG_ENABLE_VISION` or `MVG_VISION_ENABLED` |
+| `burst_images_b64` | optional; list of up to 5 base64 JPEG burst frames (each <= 5 MiB), gated by `MVG_ENABLE_VISION` or `MVG_VISION_ENABLED` |
+
+Opt-in Ingest (`vision_adpcm.py`):
+- **BLE IMA ADPCM Audio:** When `MVG_ENABLE_ADPCM=1` or `MVG_ADPCM_ENABLED=1`, requests with `APCM`-header audio are decoded into 16 kHz 16-bit mono PCM WAV (upload size capped at 512 KiB; larger payloads return HTTP 413).
+- **Multimodal Camera Frames:** When `MVG_ENABLE_VISION=1` or `MVG_VISION_ENABLED=1`, camera frames uploaded via multipart or JSON are validated (base64 validated, max 5 MiB per frame) and forwarded to the brain. Set `MVG_VISION_ADPCM=1` to enable both.
 
 `device` and `medium` are lowercased, stripped and kept only if they match
 `^[a-z0-9][a-z0-9-]{0,31}$` (else dropped). Resolution for each: the request
