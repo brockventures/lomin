@@ -40,21 +40,42 @@ Without `brain_call`, `MVG_BRAIN` defaults to `http`. A plugin that fails to imp
 ```
 POST $MVG_BRAIN_URL
 Content-Type: application/json
+Accept: text/event-stream, application/json  (only when MVG_HTTP_STREAM=1)
 Authorization: Bearer <MVG_BRAIN_TOKEN>      (only if set)
 
 {"prompt": "[VOICE via node <node> · ...] <text>...",
  "session_id": "<session>",
  "node_id": "<node>",
- "target": "<brain target for the node>"}
+ "target": "<brain target for the node>",
+ "image_b64": "<base64 JPEG frame>",        (when vision enabled and present)
+ "burst_images_b64": ["<frame1>", ...],      (when vision enabled and present)
+ "audio_b64": "<base64 WAV audio>"}          (when MVG_BRAIN_DIRECT_AUDIO=1 and present)
 ```
 
-The response must be JSON with a `"reply"` string:
+### Standard JSON Mode (`MVG_HTTP_STREAM=0`, default)
+When `MVG_HTTP_STREAM=0` (or unset), `http_brain_call` strictly expects a standard JSON response with a `"reply"` string:
 
-```
+```json
 {"reply": "<the answer, spoken as-is>"}
 ```
 
-The `http` brain has no partials: the streaming hook fires once with the full reply. A missing `MVG_BRAIN_URL` raises `MVG_BRAIN_URL not set`.
+In standard JSON mode, `http_brain_call` only accepts `application/json` and rejects or ignores streaming SSE responses. The streaming hook fires once with the full reply. A missing `MVG_BRAIN_URL` raises `MVG_BRAIN_URL not set`.
+
+### Streaming SSE Mode (`MVG_HTTP_STREAM=1`)
+When `MVG_HTTP_STREAM=1`, the gateway requests `Accept: text/event-stream, application/json` and incrementally consumes Server-Sent Events (SSE) lines from `MVG_BRAIN_URL`:
+- `event: sentence` with `{"text": "..."}` or `{"reply": "..."}`
+- `event: delta` with `{"text": "..."}` or `{"delta": "..."}` or `{"reply": "..."}`
+- `event: reply` with `{"reply": "..."}` or `{"text": "..."}`
+- OpenAI-compatible `data: {"choices": [{"delta": {"content": "..."}}]}` chunks (terminated by `data: [DONE]`)
+
+Partial text is streamed to caller listeners and sentence segmenters as each chunk arrives. If the brain answers with `application/json`, the gateway falls back gracefully to single-reply parsing.
+
+Streams are bounded by two safety gates:
+- `MAX_SSE_CHARS` (default `256 * 1024` chars, override with `MVG_MAX_SSE_CHARS`): halts accumulation if total text exceeds this cap to avoid memory bloat.
+- Wall-clock deadline (`max_stream_seconds`, defaulting to `MVG_HIVE_TIMEOUT`): halts consumption if the connection remains open past the timeout.
+
+### Direct-Audio Mode (`MVG_BRAIN_DIRECT_AUDIO=1`)
+When `MVG_BRAIN_DIRECT_AUDIO=1`, voice audio captured on a turn is base64-encoded and passed directly to the brain via the `"audio_b64"` field in the request payload.
 
 ## Backends
 
@@ -83,6 +104,8 @@ reasons.
 | `elevenlabs` | ElevenLabs text-to-speech, WAV at 24 kHz, 10 s timeout | `ELEVENLABS_API_KEY`, `MVG_ELEVENLABS_VOICE_ID`, `MVG_ELEVENLABS_MODEL` |
 | `openai` | any OpenAI-compatible `/v1/audio/speech`, 15 s timeout | `MVG_OPENAI_TTS_URL`, `MVG_OPENAI_TTS_MODEL`, `MVG_OPENAI_TTS_VOICE`, `MVG_OPENAI_TTS_KEY` |
 | `http` | generic hook: POST `{"text": ...}`, the body is the WAV, 15 s timeout | `MVG_HTTP_TTS_URL` |
+| `gemini` | Gemini TTS API, 24 kHz mono PCM wrapped in WAV, 15 s timeout | `MVG_GEMINI_API_KEY` (or `GEMINI_API_KEY`), `MVG_GEMINI_VOICE`, `MVG_GEMINI_TTS_MODEL`, `MVG_GEMINI_TTS_URL` |
+| `kokoro` | Kokoro TTS endpoint, 24 kHz mono PCM wrapped in WAV, 15 s timeout | `MVG_KOKORO_URL`, `MVG_KOKORO_VOICE`, `MVG_KOKORO_MODEL`, `MVG_KOKORO_API_KEY` (or `MVG_KOKORO_KEY`) |
 
 Example: Kokoro-FastAPI serves an OpenAI-compatible endpoint at
 `http://localhost:8880/v1/audio/speech`. To speak with it and fall back to
@@ -93,6 +116,23 @@ MVG_TTS_CHAIN=openai,piper
 MVG_OPENAI_TTS_URL=http://localhost:8880/v1/audio/speech
 MVG_OPENAI_TTS_MODEL=kokoro
 MVG_OPENAI_TTS_VOICE=af_sky
+```
+
+Example: Gemini TTS using the official Gemini audio generation API (`x-goog-api-key` header auth), falling back to Piper:
+
+```
+MVG_TTS_CHAIN=gemini,piper
+MVG_GEMINI_API_KEY=your-gemini-key
+MVG_GEMINI_VOICE=Schedar
+```
+
+Example: Dedicated Kokoro TTS endpoint (`/v1/audio/speech`), falling back to Piper:
+
+```
+MVG_TTS_CHAIN=kokoro,piper
+MVG_KOKORO_URL=http://localhost:8880/v1/audio/speech
+MVG_KOKORO_VOICE=af_heart
+MVG_KOKORO_API_KEY=optional-bearer-key
 ```
 
 **Speaker ID.** `MVG_SPEAKER_ID=0` turns speaker identification off on every
@@ -133,10 +173,20 @@ Every variable below is also listed, commented, in `.env.example`. Secrets have 
 | `MVG_ENABLE_VISION` / `MVG_VISION_ENABLED` | `0` — `1` enables multimodal camera frame ingest (`image`, `image_b64`, `burst_images_b64`, max 5 MiB) on `/voice/turn` |
 | `MVG_ENABLE_ADPCM` / `MVG_ADPCM_ENABLED` | `0` — `1` enables BLE 4-bit IMA ADPCM audio decode (`APCM` header -> 16 kHz PCM WAV, max 512 KiB) on `/voice/turn` |
 | `MVG_VISION_ADPCM` | `0` — `1` convenience alias enabling both vision frames and ADPCM decode |
+| `MVG_ENABLE_MIC_REOPEN` | `0` — `1` enables opt-in auto mic reopening by including `expects_reply` (boolean detected via question cues and punctuation) in `/ask` and `/ask/stream` SSE `reply` and `done` payloads |
+| `MVG_ARTIFACT_WEBHOOK_URL` | unset — HTTP/HTTPS webhook URL to post replies containing URLs or markdown code blocks asynchronously via a background daemon queue without delaying TTS voice replies |
+| `MVG_TRANSCRIPT_SINK_URL` | unset — HTTP/HTTPS sink URL to receive completed turn transcript records asynchronously with validated URL schemes and no cross-scheme redirect downgrade |
+| `MVG_TRANSCRIPT_AUTH_TOKEN` | unset — bearer token sent as `Authorization: Bearer <token>` with requests to `MVG_TRANSCRIPT_SINK_URL` |
+| `MVG_TRANSCRIPT_LOG_PATH` | unset — file path to append turn transcript JSONL records with strict `0o600` permissions and automated rotation |
+| `MVG_TRANSCRIPT_MAX_BYTES` | `10485760` (10 MiB) — size cap for `MVG_TRANSCRIPT_LOG_PATH` before rotating the log file to `.1` |
+| `MVG_SIDE_CHANNEL_QUEUE_SIZE` | `1000` — maximum bounded task capacity for the background side-channel webhook and transcript worker queue |
 | `MVG_PLUGIN` | unset — module name of the plugin (see "Plugin") |
 | `MVG_BRAIN` | `plugin` when the plugin has `brain_call`, else `http` — `plugin` or `http` |
 | `MVG_BRAIN_URL` | unset (required for `http`) — endpoint the `http` brain POSTs to |
 | `MVG_BRAIN_TOKEN` | unset — if set, sent as `Authorization: Bearer <token>` |
+| `MVG_HTTP_STREAM` | `0` — `1` enables streaming SSE mode for the `http` brain, requesting `Accept: text/event-stream` and incrementally consuming sentence/delta SSE lines |
+| `MVG_BRAIN_DIRECT_AUDIO` | `0` — `1` forwards raw audio (`audio_b64`) in the brain payload JSON when captured on the turn |
+| `MVG_MAX_SSE_CHARS` | `262144` (256 KiB) — maximum accumulated characters from an SSE brain stream |
 | `MVG_DEFAULT_TARGET` | `agent` — brain target for a node with no profile (`MVG_HIVE_TARGET` is read as a fallback) |
 | `MVG_HIVE_TIMEOUT` | `45` — seconds a brain call may take |
 | `MVG_AGENT_NAME` | `the assistant` — the agent's name in prompts and the spoken apology |
@@ -197,6 +247,25 @@ Every variable below is also listed, commented, in `.env.example`. Secrets have 
 | `MVG_OPENAI_TTS_VOICE` | `af_sky` |
 | `MVG_OPENAI_TTS_KEY` | unset — bearer token sent to the `openai` endpoint, only when set |
 | `MVG_HTTP_TTS_URL` | unset — generic `http` backend: POST `{"text": ...}`, the response body is the WAV (required for it) |
+| `MVG_TTS` | unset — opt-in TTS backend selector (`gemini`, `kokoro`); returns `None`/off when unset |
+| `MVG_GEMINI_API_KEY` | unset — API key for `gemini` TTS backend (passed via `x-goog-api-key` header, falls back to `GEMINI_API_KEY`) |
+| `MVG_GEMINI_VOICE` | `Schedar` — default voice for Gemini TTS |
+| `MVG_GEMINI_TTS_MODEL` | `gemini-2.5-flash-preview-tts` — model for Gemini TTS |
+| `MVG_GEMINI_TTS_URL` | unset — custom endpoint URL for Gemini TTS |
+| `MVG_KOKORO_URL` | `http://127.0.0.1:8880/v1/audio/speech` — Kokoro TTS endpoint URL |
+| `MVG_KOKORO_VOICE` | `af_heart` — default voice for Kokoro TTS |
+| `MVG_KOKORO_MODEL` | `kokoro` — default model for Kokoro TTS |
+| `MVG_KOKORO_API_KEY` | unset — bearer token for Kokoro TTS (isolated from `MVG_OPENAI_TTS_KEY`) |
+| `MVG_KOKORO_KEY` | unset — alias for `MVG_KOKORO_API_KEY` |
+| `MVG_MAX_TTS_RESPONSE_BYTES` | `26214400` (25 MiB) — maximum response size cap for TTS backend HTTP responses |
+| `MVG_HA_ENABLED` / `MVG_HA_FASTPATH` | `0` — `1` enables Home Assistant conversation intent fast-path |
+| `MVG_HA_URL` | unset — Home Assistant base URL (e.g. `http://homeassistant.local:8123`) for `/api/conversation/process` |
+| `MVG_HA_TOKEN` | unset — long-lived access token for Home Assistant REST API |
+| `MVG_HA_INTENT_TOKEN` | unset — bearer token required for executing `/intent` actions via Home Assistant |
+| `MVG_ENABLE_DEFER` | `0` — `1` enables asynchronous deferred voice answer store (`[[defer]]` marker detection and `/voice/pending` endpoints) |
+| `MVG_DEVICE_TOKENS` | unset — per-device or shared bearer tokens (`node1:tok1,node2:tok2[,shared_token]`) enforced across all API endpoints |
+| `MVG_AUTH_MAX_FAILURES` | `5` — maximum consecutive failed bearer auth attempts per client IP before lockout |
+| `MVG_AUTH_LOCKOUT_SEC` | `60.0` — lockout duration in seconds after max failed auth attempts (returns 429 Too Many Requests) |
 
 ## Endpoints
 
@@ -966,3 +1035,57 @@ Deploy: nothing is installed by this change. On the gateway host, `git pull` (th
 gitops cycle) then restart `lomin.service`; `intents/` must
 ship with `gateway.py`. Check `logs/voice-latency.jsonl` for `intent` fields and
 run `voice-latency-report.py --since 1d`.
+
+## Side-Channel Webhooks, Transcripts & Mic Reopen
+
+Lomin supports non-blocking side-channel notifications, turn transcript streaming, and opt-in question-driven microphone reopening (`side_channel.py`).
+
+### Opt-In Auto Mic Reopen (`MVG_ENABLE_MIC_REOPEN`)
+- **Default:** `0` (disabled). When disabled, `/ask` and `/ask/stream` SSE `reply` and `done` payloads remain strictly unmodified to preserve compatibility with existing nodes and clients.
+- **Enabled (`MVG_ENABLE_MIC_REOPEN=1`):** Inspects the final spoken reply with `reply_expects_reply()`. If the reply ends with a question mark (accounting for whitespace, quotes, and emoji ornaments), the gateway attaches `"expects_reply": true` to the SSE `reply` and `done` events, indicating to the client device that its microphone should immediately reopen for a follow-up answer.
+
+### Side-Channel Artifact Webhooks (`MVG_ARTIFACT_WEBHOOK_URL`)
+- When configured, raw replies are checked for URLs (`https?://...`) and Markdown code blocks (```` ```...``` ````).
+- If artifacts are detected, the spoken reply is augmented with a verbal cue ("*Sending the link to Discord.*") unless already cued.
+- The raw reply is sent whole to the side-channel webhook payload without markdown stripping, so formatting, links, and code blocks are preserved intact in the destination channel.
+- The webhook payload is dispatched via a dedicated background worker queue independent of transcript logging (`MVG_SIDE_CHANNEL_QUEUE_SIZE`, default 1000), ensuring slow or unreachable webhooks never block speech synthesis or drop transcript events.
+
+### Turn Transcripts (`MVG_TRANSCRIPT_SINK_URL` and `MVG_TRANSCRIPT_LOG_PATH`)
+- Turn records (including prompt, spoken reply, timing metrics, and node ID) are exported asynchronously via a dedicated background worker queue.
+- **HTTP/HTTPS Sink (`MVG_TRANSCRIPT_SINK_URL`):** Dispatches JSON turn records. Validates URL schemes (only `http` and `https` permitted) and blocks insecure cross-scheme redirect downgrades. Supports optional bearer authorization via `MVG_TRANSCRIPT_AUTH_TOKEN`.
+- **JSONL File Sink (`MVG_TRANSCRIPT_LOG_PATH`):** Appends turn records to a local JSONL file with strict `0o600` permissions (`-rw-------`). Automatically rotates the active log file to `.1` when size exceeds `MVG_TRANSCRIPT_MAX_BYTES` (default 10 MiB).
+
+## Home Assistant Conversation Fast-Path & Authorization
+
+When `MVG_HA_ENABLED=1` (or `MVG_HA_FASTPATH=1`), Lomin consults Home Assistant's `/api/conversation/process` before falling through to the brain.
+
+- **Fast-Path Matching:** Natural-language control commands (e.g., turning on lights, running scripts, setting thermostats) match HA intents deterministically. Matched intents return immediately with `intent: "ha_conversation"` and the spoken confirmation text.
+- **Security & Authorization:**
+  - When `MVG_HA_INTENT_TOKEN` or `MVG_DEVICE_TOKENS` is configured, calls to `/intent` require authorization.
+  - Authorization requires either a valid Bearer token (`Authorization: Bearer <token>`) matching `MVG_HA_INTENT_TOKEN` / device verifier, or a verified speaker identity via trusted gateway headers (`X-Voice-Claimed-Speaker` validated with `MVG_TRUSTED_KEY`) or biometric voice ID (`voice_id.status == "verified"`).
+  - Unauthenticated requests passing an arbitrary `{"speaker": "..."}` JSON field are strictly rejected with HTTP 401 Unauthorized; the speaker field alone never bypasses authorization.
+- **Circuit Breaker:** Consecutive timeouts or upstream network errors trigger an automated circuit breaker cooldown, failing fast to the brain to prevent turn stalls.
+
+## Per-Device Bearer Auth & Deferred Async Voice Answers
+
+### Endpoint Bearer Authentication (`MVG_DEVICE_TOKENS`)
+
+When `MVG_DEVICE_TOKENS` is configured, Lomin enforces Bearer token authentication across all API endpoints:
+- **Protected Endpoints:** `/voice/pending` (GET & POST), `/voice/turn`, `/ask`, `/ask/stream`, `/stt`, `/embed`, `/ambient`, and `/intent`.
+- **Configuration Format:** Comma-separated per-device tokens and optional shared fallback:
+  `MVG_DEVICE_TOKENS="node1:tok1,node2:tok2,shared_fallback"`
+- **Lockout & Rate Limiting:**
+  - Failed authentication attempts are tracked per client IP address.
+  - After `MVG_AUTH_MAX_FAILURES` (default 5) consecutive failures within `MVG_AUTH_LOCKOUT_SEC` (default 60s), subsequent requests are immediately rejected with HTTP 429 Too Many Requests until the lockout window expires.
+  - Successful authentication clears the failure history for the client.
+
+### Deferred Voice Answers (`MVG_ENABLE_DEFER`)
+
+When `MVG_ENABLE_DEFER=1`, the gateway supports deferred asynchronous voice replies:
+- **Marker Detection:** Replies containing `[[defer]]` markers indicate long-running or asynchronous task results.
+- **Marker Stripping:** The marker is stripped from spoken audio replies (`strip_defer_marker`) so it is never synthesized into TTS speech.
+- **Pending Store:** The pending answer is stored in a thread-safe, memory-bounded store (`PendingVoiceAnswerStore`) indexed by node ID.
+- **Client Retrieval (`/voice/pending`):**
+  - `GET /voice/pending?node=<node>&pop=1`: Retrieves and pops the oldest pending answer for the node.
+  - `POST /voice/pending`: Stores an asynchronous answer directly into the pending queue for subsequent voice delivery.
+

@@ -181,6 +181,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
@@ -198,6 +199,8 @@ from audio_utils import (  # noqa: E402,F401
 )
 from vision_adpcm import (  # noqa: E402,F401
     ADPCM_MAGIC,
+    MAX_IMAGE_B64_BYTES,
+    MAX_IMAGE_BYTES,
     decode_adpcm_to_wav,
     extract_vision_payloads,
 )
@@ -213,6 +216,7 @@ from pending_and_auth import (  # noqa: E402,F401
     get_device_token_verifier,
     get_pending_store,
     has_defer_marker,
+    is_defer_enabled,
     strip_defer_marker,
 )
 
@@ -242,18 +246,64 @@ _try_intent = getattr(_plugin, "try_intent", None) or (lambda text: None)
 _NO_INTENT = {"hit": False, "intent": None, "match_ms": 0.0, "handler_ms": None, "reason": "miss"}
 
 
-def _intent(text: str, has_images: bool = False) -> dict:
+def _is_ha_authorized(
+    auth_header: str | None = None,
+    node_id: str = "",
+    speaker: str = "",
+    speaker_score: Any = None,
+    voice_id: dict | None = None,
+    claimed_speaker: str = "",
+) -> bool:
+    """Verify whether caller is authorized to execute Home Assistant control."""
+    ha_intent_token = os.environ.get("MVG_HA_INTENT_TOKEN", "").strip()
+    device_verifier = get_device_token_verifier()
+    tokens_configured = bool(ha_intent_token) or device_verifier.is_enabled
+    if not tokens_configured:
+        return True
+
+    # 1. Check verified speaker identity
+    if claimed_speaker:
+        return True
+    if isinstance(voice_id, dict) and voice_id.get("status") == "verified":
+        return True
+
+    # 2. Check bearer token in Authorization header
+    if auth_header:
+        token = BearerTokenVerifier._extract_token(auth_header)
+        if token:
+            if ha_intent_token and hmac.compare_digest(token.encode("utf-8"), ha_intent_token.encode("utf-8")):
+                return True
+            if device_verifier.is_enabled and device_verifier.verify(auth_header, node_id):
+                return True
+
+    return False
+
+
+def _intent(
+    text: str,
+    has_images: bool = False,
+    *,
+    ha_authorized: bool = True,
+) -> dict:
     """The fast path's result in the shape the call sites read. A plugin that
-    answers None, or raises, is a miss: the turn goes to the brain."""
+    answers None, or raises, or returns {'hit': False}, is a miss: Home Assistant
+    fast-path is consulted before falling through to the brain."""
     try:
         res = _try_intent(text)
     except Exception as exc:  # a broken plugin must never lose a turn
         return {**_NO_INTENT, "reason": f"intent_error:{type(exc).__name__}"}
-    if res is not None:
+
+    plugin_miss = isinstance(res, dict) and res.get("hit") is False
+    if res is not None and not plugin_miss:
         return res
 
-    ha_enabled = bool(HA_ENABLED) or (os.environ.get("MVG_HA_ENABLED", "0") == "1")
+    ha_enabled = bool(HA_ENABLED) or (
+        os.environ.get("MVG_HA_ENABLED", "0") == "1"
+        or os.environ.get("MVG_HA_FASTPATH", "0") == "1"
+    )
     if ha_enabled:
+        if not ha_authorized:
+            return {**_NO_INTENT, "reason": "ha_unauthorized"}
         t0 = time.time()
         try:
             matched, speech, meta = try_ha_conversation(text, has_images=has_images)
@@ -281,6 +331,8 @@ def _intent(text: str, has_images: bool = False) -> dict:
                 "reason": f"ha_error:{type(exc).__name__}",
             }
 
+    if res is not None:
+        return res
     return dict(_NO_INTENT)
 
 # --- Paths -------------------------------------------------------------
@@ -336,11 +388,140 @@ def is_adpcm_enabled() -> bool:
 # Streaming SSE HTTP brain & direct-audio flags (Chunk 2 parity)
 HTTP_BRAIN_STREAM = os.environ.get("MVG_HTTP_STREAM", "0") == "1"
 BRAIN_DIRECT_AUDIO = os.environ.get("MVG_BRAIN_DIRECT_AUDIO", "0") == "1"
+MAX_SSE_CHARS = int(os.environ.get("MVG_MAX_SSE_CHARS", str(256 * 1024)))
+MAX_AUDIO_B64_BYTES = int(os.environ.get("MVG_MAX_AUDIO_B64_BYTES", str(10 * 1024 * 1024)))
+MAX_AUDIO_BYTES = int(os.environ.get("MVG_MAX_AUDIO_BYTES", str(10 * 1024 * 1024)))
+
+
+def is_http_stream_enabled() -> bool:
+    return bool(HTTP_BRAIN_STREAM) or (os.environ.get("MVG_HTTP_STREAM", "0") == "1")
+
+
+def is_valid_image_bytes(data: bytes) -> bool:
+    """Validate image magic bytes for JPEG, PNG, or WEBP."""
+    if not isinstance(data, (bytes, bytearray)) or len(data) < 3:
+        return False
+    if data[:3] == b"\xff\xd8\xff":
+        return True
+    if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        return True
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return True
+    return False
+
+
+def validate_multimodal_payload(req: dict) -> tuple[int | None, str | None]:
+    """Validate type, base64 validity, and max size of multimodal fields.
+
+    Checks image_b64, burst_images_b64, audio_b64, as well as raw image
+    and burst_images bytes if present in req.
+    Returns (status_code, error_message) on failure, or (None, None) if valid.
+    """
+    if not isinstance(req, dict):
+        return 400, "request body must be a JSON object"
+
+    # Raw image inputs: image or image_bytes
+    raw_img = req.get("image") if "image" in req else req.get("image_bytes")
+    if raw_img is not None:
+        if isinstance(raw_img, (bytes, bytearray)):
+            if len(raw_img) > MAX_IMAGE_BYTES:
+                return 413, f"image payload exceeds maximum allowed size ({MAX_IMAGE_BYTES} bytes)"
+            if not is_valid_image_bytes(raw_img):
+                return 400, "image is not a valid image format (must be JPEG, PNG, or WEBP)"
+        elif isinstance(raw_img, str):
+            if len(raw_img) > MAX_IMAGE_B64_BYTES:
+                return 413, f"image payload exceeds maximum allowed size ({MAX_IMAGE_B64_BYTES} bytes)"
+            try:
+                decoded = base64.b64decode(raw_img, validate=True)
+            except Exception:
+                return 400, "image is not valid base64"
+            if len(decoded) > MAX_IMAGE_BYTES:
+                return 413, f"image decoded data exceeds maximum allowed size ({MAX_IMAGE_BYTES} bytes)"
+            if not is_valid_image_bytes(decoded):
+                return 400, "image is not a valid image format (must be JPEG, PNG, or WEBP)"
+        else:
+            return 400, "image must be bytes or string"
+
+    # Raw burst_images list
+    if "burst_images" in req and req["burst_images"] is not None:
+        val = req["burst_images"]
+        if not isinstance(val, list):
+            return 400, "burst_images must be a list"
+        for idx, item in enumerate(val):
+            if isinstance(item, (bytes, bytearray)):
+                if len(item) > MAX_IMAGE_BYTES:
+                    return 413, f"burst_images[{idx}] payload exceeds maximum allowed size ({MAX_IMAGE_BYTES} bytes)"
+                if not is_valid_image_bytes(item):
+                    return 400, f"burst_images[{idx}] is not a valid image format (must be JPEG, PNG, or WEBP)"
+            elif isinstance(item, str):
+                if len(item) > MAX_IMAGE_B64_BYTES:
+                    return 413, f"burst_images[{idx}] payload exceeds maximum allowed size ({MAX_IMAGE_B64_BYTES} bytes)"
+                try:
+                    decoded = base64.b64decode(item, validate=True)
+                except Exception:
+                    return 400, f"burst_images[{idx}] is not valid base64"
+                if len(decoded) > MAX_IMAGE_BYTES:
+                    return 413, f"burst_images[{idx}] decoded data exceeds maximum allowed size ({MAX_IMAGE_BYTES} bytes)"
+                if not is_valid_image_bytes(decoded):
+                    return 400, f"burst_images[{idx}] is not a valid image format (must be JPEG, PNG, or WEBP)"
+            else:
+                return 400, f"burst_images[{idx}] must be bytes or string"
+
+    # 1. image_b64
+    if "image_b64" in req and req["image_b64"] is not None:
+        val = req["image_b64"]
+        if not isinstance(val, str):
+            return 400, "image_b64 must be a string"
+        if len(val) > MAX_IMAGE_B64_BYTES:
+            return 413, f"image_b64 payload exceeds maximum allowed size ({MAX_IMAGE_B64_BYTES} bytes)"
+        try:
+            decoded = base64.b64decode(val, validate=True)
+        except Exception:
+            return 400, "image_b64 is not valid base64"
+        if len(decoded) > MAX_IMAGE_BYTES:
+            return 413, f"image_b64 decoded data exceeds maximum allowed size ({MAX_IMAGE_BYTES} bytes)"
+
+    # 2. burst_images_b64
+    if "burst_images_b64" in req and req["burst_images_b64"] is not None:
+        val = req["burst_images_b64"]
+        if not isinstance(val, list):
+            return 400, "burst_images_b64 must be a list"
+        for idx, item in enumerate(val):
+            if not isinstance(item, str):
+                return 400, f"burst_images_b64[{idx}] must be a string"
+            if len(item) > MAX_IMAGE_B64_BYTES:
+                return 413, f"burst_images_b64[{idx}] payload exceeds maximum allowed size ({MAX_IMAGE_B64_BYTES} bytes)"
+            try:
+                decoded = base64.b64decode(item, validate=True)
+            except Exception:
+                return 400, f"burst_images_b64[{idx}] is not valid base64"
+            if len(decoded) > MAX_IMAGE_BYTES:
+                return 413, f"burst_images_b64[{idx}] decoded data exceeds maximum allowed size ({MAX_IMAGE_BYTES} bytes)"
+
+    # 3. audio_b64
+    if "audio_b64" in req and req["audio_b64"] is not None:
+        val = req["audio_b64"]
+        if not isinstance(val, str):
+            return 400, "audio_b64 must be a string"
+        if len(val) > MAX_AUDIO_B64_BYTES:
+            return 413, f"audio_b64 payload exceeds maximum allowed size ({MAX_AUDIO_B64_BYTES} bytes)"
+        try:
+            decoded = base64.b64decode(val, validate=True)
+        except Exception:
+            return 400, "audio_b64 is not valid base64"
+        if len(decoded) > MAX_AUDIO_BYTES:
+            return 413, f"audio_b64 decoded data exceeds maximum allowed size ({MAX_AUDIO_BYTES} bytes)"
+
+    return None, None
 
 # Home Assistant conversation intent fast-path flags (Chunk 3 parity)
-HA_ENABLED = os.environ.get("MVG_HA_ENABLED", "0") == "1"
+HA_ENABLED = (
+    os.environ.get("MVG_HA_ENABLED", "0") == "1"
+    or os.environ.get("MVG_HA_FASTPATH", "0") == "1"
+)
 HA_URL = os.environ.get("MVG_HA_URL", "")
 HA_TOKEN = os.environ.get("MVG_HA_TOKEN", "")
+HA_INTENT_TOKEN = os.environ.get("MVG_HA_INTENT_TOKEN", "")
 
 WHISPER_URL = os.environ.get("WHISPER_URL", "http://127.0.0.1:9099/transcribe")
 WHISPER_HEALTH_URL = os.environ.get(
@@ -1762,20 +1943,26 @@ MVG_BRAIN_URL = os.environ.get("MVG_BRAIN_URL", "")
 MVG_BRAIN_TOKEN = os.environ.get("MVG_BRAIN_TOKEN", "")
 
 
-def consume_brain_sse_lines(lines, on_partial=None) -> str:
+def consume_brain_sse_lines(lines, on_partial=None, max_stream_seconds: float | None = None) -> str:
     """Consume Server-Sent Events (SSE) lines from an HTTP brain stream.
 
     Supports SSE `event: sentence`, `event: delta`, and `event: reply`
     (with JSON {"text": ...} or {"reply": ...}) as well as OpenAI-style
     `data: {"choices": [{"delta": {"content": ...}}]}` lines.
     Calls `on_partial(accumulated_text)` as each text chunk arrives.
+    Enforces MAX_SSE_CHARS char ceiling and max_stream_seconds total deadline.
     Returns the final reply string.
     """
     current_event = ""
-    accumulated = ""
+    chunks: list[str] = []
+    current_len = 0
     final_reply = ""
+    start_time = time.monotonic()
 
     for raw_line in lines:
+        if max_stream_seconds is not None and (time.monotonic() - start_time) > max_stream_seconds:
+            break
+
         if isinstance(raw_line, (bytes, bytearray)):
             line = raw_line.decode("utf-8", errors="replace")
         else:
@@ -1813,9 +2000,18 @@ def consume_brain_sse_lines(lines, on_partial=None) -> str:
                         if isinstance(delta, dict):
                             content = delta.get("content")
                             if isinstance(content, str) and content:
-                                accumulated += content
+                                if current_len + len(content) > MAX_SSE_CHARS:
+                                    allowed = max(0, MAX_SSE_CHARS - current_len)
+                                    if allowed > 0:
+                                        chunks.append(content[:allowed])
+                                        current_len += allowed
+                                        if on_partial:
+                                            on_partial("".join(chunks))
+                                    break
+                                chunks.append(content)
+                                current_len += len(content)
                                 if on_partial:
-                                    on_partial(accumulated)
+                                    on_partial("".join(chunks))
                                 continue
 
             chunk = ""
@@ -1843,41 +2039,71 @@ def consume_brain_sse_lines(lines, on_partial=None) -> str:
                 continue
 
             if current_event == "reply":
-                accumulated = chunk
                 final_reply = chunk
+                if len(chunk) > MAX_SSE_CHARS:
+                    chunk = chunk[:MAX_SSE_CHARS]
+                chunks = [chunk]
+                current_len = len(chunk)
                 if on_partial:
-                    on_partial(accumulated)
+                    on_partial(chunk)
             elif current_event == "sentence":
-                if accumulated and not accumulated.endswith((" ", "\n")) and not chunk.startswith(" "):
-                    accumulated += " " + chunk
-                else:
-                    accumulated += chunk
+                sep = ""
+                if chunks and not chunks[-1].endswith((" ", "\n")) and not chunk.startswith(" "):
+                    sep = " "
+                to_add = sep + chunk if sep else chunk
+                if current_len + len(to_add) > MAX_SSE_CHARS:
+                    allowed = max(0, MAX_SSE_CHARS - current_len)
+                    if allowed > 0:
+                        chunks.append(to_add[:allowed])
+                        current_len += allowed
+                        if on_partial:
+                            on_partial("".join(chunks))
+                    break
+                chunks.append(to_add)
+                current_len += len(to_add)
                 if on_partial:
-                    on_partial(accumulated)
+                    on_partial("".join(chunks))
             elif current_event == "delta":
-                accumulated += chunk
+                to_add = chunk
+                if current_len + len(to_add) > MAX_SSE_CHARS:
+                    allowed = max(0, MAX_SSE_CHARS - current_len)
+                    if allowed > 0:
+                        chunks.append(to_add[:allowed])
+                        current_len += allowed
+                        if on_partial:
+                            on_partial("".join(chunks))
+                    break
+                chunks.append(to_add)
+                current_len += len(to_add)
                 if on_partial:
-                    on_partial(accumulated)
+                    on_partial("".join(chunks))
             else:
-                if final_reply and accumulated == chunk:
+                if final_reply and "".join(chunks) == chunk:
                     if on_partial:
-                        on_partial(accumulated)
+                        on_partial("".join(chunks))
                 else:
-                    accumulated += chunk
+                    to_add = chunk
+                    if current_len + len(to_add) > MAX_SSE_CHARS:
+                        allowed = max(0, MAX_SSE_CHARS - current_len)
+                        if allowed > 0:
+                            chunks.append(to_add[:allowed])
+                            current_len += allowed
+                            if on_partial:
+                                on_partial("".join(chunks))
+                        break
+                    chunks.append(to_add)
+                    current_len += len(to_add)
                     if on_partial:
-                        on_partial(accumulated)
+                        on_partial("".join(chunks))
 
-    return final_reply if final_reply else accumulated
+    return final_reply if final_reply else "".join(chunks)
 
 
-def http_brain_call(prompt: str, session_id: str, node_id: str, speaker: str,
-                    speaker_score, timeout: int,
-                    image_b64: str | None = None, burst_images_b64: list[str] | None = None,
-                    audio_b64: str | None = None) -> str:
-    """Brain over plain HTTP (standalone). POSTs the framed prompt as JSON to
-    MVG_BRAIN_URL and returns the response's "reply" string."""
-    if not MVG_BRAIN_URL:
-        raise RuntimeError("MVG_BRAIN_URL not set")
+def build_http_brain_body(prompt: str, session_id: str, node_id: str, speaker: str,
+                          speaker_score,
+                          image_b64: str | None = None, burst_images_b64: list[str] | None = None,
+                          audio_b64: str | None = None) -> tuple[dict, bytes]:
+    """Shared request body builder for http_brain_call and http_brain_call_stream."""
     body_dict = {
         "prompt": _frame_for_call(prompt, node_id, speaker, speaker_score),
         "session_id": session_id,
@@ -1899,16 +2125,35 @@ def http_brain_call(prompt: str, session_id: str, node_id: str, speaker: str,
         aud = audio_b64 or ctx.get("audio_b64")
         if aud:
             body_dict["audio_b64"] = aud
-    body = json.dumps(body_dict).encode("utf-8")
+    return body_dict, json.dumps(body_dict).encode("utf-8")
+
+
+def http_brain_call(prompt: str, session_id: str, node_id: str, speaker: str,
+                    speaker_score, timeout: int,
+                    image_b64: str | None = None, burst_images_b64: list[str] | None = None,
+                    audio_b64: str | None = None) -> str:
+    """Brain over plain HTTP (standalone). POSTs the framed prompt as JSON to
+    MVG_BRAIN_URL and returns the response's "reply" string.
+
+    When MVG_HTTP_STREAM is enabled, also accepts and consumes text/event-stream.
+    """
+    if not MVG_BRAIN_URL:
+        raise RuntimeError("MVG_BRAIN_URL not set")
+    is_stream = is_http_stream_enabled()
+    _, body = build_http_brain_body(prompt, session_id, node_id, speaker, speaker_score,
+                                    image_b64=image_b64, burst_images_b64=burst_images_b64,
+                                    audio_b64=audio_b64)
     headers = {"Content-Type": "application/json"}
+    if is_stream:
+        headers["Accept"] = "text/event-stream, application/json"
     if MVG_BRAIN_TOKEN:
         headers["Authorization"] = f"Bearer {MVG_BRAIN_TOKEN}"
     req = Request(MVG_BRAIN_URL, data=body, headers=headers, method="POST")
     with urlopen(req, timeout=timeout) as resp:
         headers_obj = getattr(resp, "headers", None)
         content_type = headers_obj.get("Content-Type", "") if hasattr(headers_obj, "get") else ""
-        if "text/event-stream" in content_type:
-            return consume_brain_sse_lines(resp, on_partial=None)
+        if is_stream and "text/event-stream" in content_type:
+            return consume_brain_sse_lines(resp, on_partial=None, max_stream_seconds=timeout)
         data = json.loads(resp.read().decode("utf-8"))
     reply = data.get("reply")
     if not isinstance(reply, str):
@@ -1926,30 +2171,10 @@ def http_brain_call_stream(prompt: str, session_id: str, node_id: str, speaker: 
     if not MVG_BRAIN_URL:
         raise RuntimeError("MVG_BRAIN_URL not set")
 
-    is_stream = bool(HTTP_BRAIN_STREAM) or (os.environ.get("MVG_HTTP_STREAM", "0") == "1")
-    body_dict = {
-        "prompt": _frame_for_call(prompt, node_id, speaker, speaker_score),
-        "session_id": session_id,
-        "node_id": node_id,
-        "target": _call_target(node_id),
-    }
-    enable_vision = is_vision_enabled()
-    if enable_vision:
-        ctx = getattr(_FRAME_CTX, "ctx", None) or {}
-        img = image_b64 or ctx.get("image_b64")
-        burst = burst_images_b64 or ctx.get("burst_images_b64")
-        if img:
-            body_dict["image_b64"] = img
-        if burst:
-            body_dict["burst_images_b64"] = burst
-    brain_direct_audio = bool(BRAIN_DIRECT_AUDIO) or (os.environ.get("MVG_BRAIN_DIRECT_AUDIO", "0") == "1")
-    if brain_direct_audio:
-        ctx = getattr(_FRAME_CTX, "ctx", None) or {}
-        aud = audio_b64 or ctx.get("audio_b64")
-        if aud:
-            body_dict["audio_b64"] = aud
-
-    body = json.dumps(body_dict).encode("utf-8")
+    is_stream = is_http_stream_enabled()
+    _, body = build_http_brain_body(prompt, session_id, node_id, speaker, speaker_score,
+                                    image_b64=image_b64, burst_images_b64=burst_images_b64,
+                                    audio_b64=audio_b64)
     headers = {"Content-Type": "application/json"}
     if is_stream:
         headers["Accept"] = "text/event-stream, application/json"
@@ -1961,7 +2186,7 @@ def http_brain_call_stream(prompt: str, session_id: str, node_id: str, speaker: 
         headers_obj = getattr(resp, "headers", None)
         content_type = headers_obj.get("Content-Type", "") if hasattr(headers_obj, "get") else ""
         if "text/event-stream" in content_type or (is_stream and "application/json" not in content_type):
-            reply = consume_brain_sse_lines(resp, on_partial=on_partial)
+            reply = consume_brain_sse_lines(resp, on_partial=on_partial, max_stream_seconds=timeout)
         else:
             data = json.loads(resp.read().decode("utf-8"))
             reply = data.get("reply")
@@ -2128,9 +2353,11 @@ def _desktop_backend(text: str) -> bytes:
 TTS_BACKENDS = {
     "desktop": _desktop_backend,
     "piper": lambda text: piper_speak(text),
-    "elevenlabs": tts_backends.elevenlabs_speak,
-    "openai": tts_backends.openai_speech_speak,
-    "http": tts_backends.http_tts_speak,
+    "elevenlabs": lambda text: tts_backends.elevenlabs_speak(text),
+    "openai": lambda text: tts_backends.openai_speech_speak(text),
+    "http": lambda text: tts_backends.http_tts_speak(text),
+    "gemini": lambda text: tts_backends.gemini_speak(text),
+    "kokoro": lambda text: tts_backends.kokoro_speak(text),
 }
 # Reason labels for the fallback log. "desktop-tts" is the label this chain
 # has always logged; every other entry is its own name.
@@ -2426,13 +2653,46 @@ class GatewayHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _get_client_id(self, node_id: str = "") -> str:
+        if hasattr(self, "client_address") and self.client_address and isinstance(self.client_address, (tuple, list)):
+            ip = str(self.client_address[0]).strip()
+            if ip:
+                return ip
+        if hasattr(self, "headers") and self.headers:
+            xff = self.headers.get("X-Forwarded-For")
+            if xff:
+                ip = xff.split(",")[0].strip()
+                if ip:
+                    return ip
+        return node_id or "127.0.0.1"
+
+    def _check_bearer_auth(self, node_id: str = "", endpoint: str = "", t0: float = 0.0) -> bool:
+        verifier = get_device_token_verifier()
+        if not verifier.is_enabled:
+            return True
+        client_id = self._get_client_id(node_id)
+        if verifier.is_locked_out(client_id):
+            self._send_json(429, {"error": "too many failed attempts, locked out"})
+            if t0:
+                log_request(endpoint, (time.time() - t0) * 1000, "error:locked_out", node=node_id)
+            return False
+        auth_header = self.headers.get("Authorization", "")
+        if not verifier.verify(auth_header, node_id):
+            verifier.record_failure(client_id)
+            self._send_json(401, {"error": "unauthorized"})
+            if t0:
+                log_request(endpoint, (time.time() - t0) * 1000, "error:unauthorized", node=node_id)
+            return False
+        verifier.record_success(client_id)
+        return True
+
     # -- routes --
 
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == "/health":
             return self._handle_health()
-        if path == "/voice/pending" and (os.environ.get("MVG_ENABLE_DEFER", "0") == "1"):
+        if path == "/voice/pending" and is_defer_enabled():
             return self._handle_pending_get()
         self._send_json(404, {"error": "not found"})
 
@@ -2468,7 +2728,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return self._handle_speech()
         if path == "/embed":
             return self._handle_embed()
-        if path == "/voice/pending" and (os.environ.get("MVG_ENABLE_DEFER", "0") == "1"):
+        if path == "/voice/pending" and is_defer_enabled():
             return self._handle_pending_post()
         self._send_json(404, {"error": "not found"})
 
@@ -2490,6 +2750,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         qs = parse_qs(parsed.query)
         node = (qs.get("node") or qs.get("node_id") or [""])[0].strip()
+        if not self._check_bearer_auth(node, "/voice/pending", t0):
+            return
         if not node:
             self._send_json(400, {"error": "node parameter required"})
             log_request("/voice/pending", (time.time() - t0) * 1000, "error:no_node")
@@ -2520,6 +2782,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         except Exception:
             req = {}
         node = (req.get("node_id") or req.get("node") or "").strip()
+        if not self._check_bearer_auth(node, "/voice/pending", t0):
+            return
         answer = (req.get("answer") or "").strip()
         prompt = (req.get("prompt") or "").strip()
         topic = (req.get("topic") or "").strip()
@@ -2560,6 +2824,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         elif content_type in ("audio/wav", "application/octet-stream", "") :
             wav_bytes = body
         _set_req_node(node_id)
+        if not self._check_bearer_auth(node_id, "/stt", t0):
+            return
         if not wav_bytes:
             self._send_json(400, {"error": "no audio payload found"})
             log_request("/stt", (time.time() - t0) * 1000, "error:no_audio")
@@ -2605,8 +2871,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         if not node_id:
             qs = parse_qs(parsed.query)
-            node_id = (qs.get("node_id") or [""])[0]
+            node_id = (qs.get("node_id") or [""])[0].strip()
         _set_req_node(node_id)
+        if not self._check_bearer_auth(node_id, "/ambient", t0):
+            return
 
         if not wav_bytes:
             self._send_json(400, {"error": "no audio payload found"})
@@ -2732,12 +3000,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
         body = self._read_body()
         try:
             req = json.loads(body.decode("utf-8")) if body else {}
+            if not isinstance(req, dict):
+                self._send_json(400, {"error": "request body must be a JSON object"})
+                return
         except Exception:
-            req = {}
+            self._send_json(400, {"error": "invalid JSON body"})
+            return
+
+        node_id = (req.get("node_id") or self.headers.get("X-Node-Id") or "").strip()
+        if not self._check_bearer_auth(node_id, "/ask", t0):
+            return
+
+        err_code, err_msg = validate_multimodal_payload(req)
+        if err_code is not None:
+            self._send_json(err_code, {"error": err_msg})
+            return
 
         prompt = req.get("prompt") or ""
         session_id = req.get("session_id") or ""
-        node_id = req.get("node_id") or ""
         speaker = req.get("speaker") or ""
         speaker_score = req.get("speaker_score")
         _set_req_node(node_id)
@@ -2808,22 +3088,34 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 reply = strip_markdown(raw)
                 if os.environ.get("MVG_ARTIFACT_WEBHOOK_URL"):
                     reply, _ = forward_artifacts_to_webhook(raw, reply)
+                if is_defer_enabled() and (has_defer_marker(raw) or has_defer_marker(reply)):
+                    get_pending_store().store(
+                        node_id=node_id,
+                        prompt=prompt,
+                        answer=strip_defer_marker(reply),
+                    )
                 reply = strip_defer_marker(reply)
                 # Only a real answer opens the follow-up window for /ambient
                 # — the apology isn't a conversational turn worth treating
                 # as "the agent is mid-conversation" on this node.
                 record_reply(node_id, reply)
 
-        expects = reply_expects_reply(reply)
+        mic_reopen_on = os.environ.get("MVG_ENABLE_MIC_REOPEN", "0").strip().lower() in ("1", "true", "yes", "on")
+        reply_dict: dict[str, Any] = {"reply": reply}
+        done_dict: dict[str, Any] = {}
+        if mic_reopen_on:
+            expects = reply_expects_reply(reply)
+            reply_dict["expects_reply"] = expects
+            done_dict["expects_reply"] = expects
         try:
-            self.wfile.write(self._sse_event("reply", {"reply": reply, "expects_reply": expects}))
-            self.wfile.write(self._sse_event("done", {"expects_reply": expects}))
+            self.wfile.write(self._sse_event("reply", reply_dict))
+            self.wfile.write(self._sse_event("done", done_dict))
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass
         log_request("/ask", (time.time() - t0) * 1000, outcome, node_id=node_id)
         if os.environ.get("MVG_TRANSCRIPT_SINK_URL") or os.environ.get("MVG_TRANSCRIPT_LOG_PATH"):
-            emit_turn_transcript({
+            tr_rec: dict[str, Any] = {
                 "kind": "ask",
                 "endpoint": "/ask",
                 "node_id": node_id or None,
@@ -2831,10 +3123,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "transcript": prompt,
                 "reply": reply,
                 "outcome": outcome,
-                "expects_reply": expects,
                 "total_ms": round((time.time() - t0) * 1000, 1),
                 "timestamp": time.time(),
-            })
+            }
+            if mic_reopen_on:
+                tr_rec["expects_reply"] = reply_expects_reply(reply)
+            emit_turn_transcript(tr_rec)
 
     # -- /ask/stream (SSE, MANDOS) --
     #
@@ -2872,12 +3166,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
         body = self._read_body()
         try:
             req = json.loads(body.decode("utf-8")) if body else {}
+            if not isinstance(req, dict):
+                self._send_json(400, {"error": "request body must be a JSON object"})
+                return
         except Exception:
-            req = {}
+            self._send_json(400, {"error": "invalid JSON body"})
+            return
+
+        node_id = (req.get("node_id") or self.headers.get("X-Node-Id") or "").strip()
+        if not self._check_bearer_auth(node_id, "/ask/stream", t0):
+            return
+
+        err_code, err_msg = validate_multimodal_payload(req)
+        if err_code is not None:
+            self._send_json(err_code, {"error": err_msg})
+            return
 
         prompt = req.get("prompt") or ""
         session_id = req.get("session_id") or ""
-        node_id = req.get("node_id") or ""
         speaker = req.get("speaker") or ""
         speaker_score = req.get("speaker_score")
         _set_req_node(node_id)
@@ -2914,6 +3220,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
         except Exception:
             self._send_json(400, {"error": "invalid JSON body"})
             return
+
+        node_id = (req.get("node") or req.get("node_id") or self.headers.get("X-Node-Id") or "").strip()
+        if not self._check_bearer_auth(node_id, "/intent", t0):
+            return
         text = req.get("text")
         if not isinstance(text, str) or not text.strip():
             self._send_json(400, {"error": "text required"})
@@ -2921,8 +3231,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
         node_id = req.get("node") or ""
         speaker = req.get("speaker") or ""
         _set_req_node(node_id)
-        fast = _intent(text)
+        claimed, _ = self._trusted_claimed_speaker()
+        auth_header = self.headers.get("Authorization", "")
+        ha_auth = _is_ha_authorized(
+            auth_header=auth_header,
+            node_id=node_id,
+            speaker=speaker,
+            speaker_score=req.get("speaker_score"),
+            claimed_speaker=claimed,
+        )
+        fast = _intent(text, ha_authorized=ha_auth)
         if not fast["hit"]:
+            if fast.get("reason") == "ha_unauthorized":
+                self._send_json(401, {"error": "unauthorized"})
+                log_request("/intent", (time.time() - t0) * 1000, "error:unauthorized", node=node_id)
+                return
             log_request("/intent", (time.time() - t0) * 1000, "ok:no_match", node=node_id,
                         intent=fast["intent"] or "miss", intent_match_ms=fast["match_ms"],
                         intent_handler_ms=fast["handler_ms"], reason=fast["reason"])
@@ -3004,6 +3327,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         voice = bool(opts.get("voice"))
         audio_chunk = bool(opts.get("audio_chunk"))
         log_extra = log_extra or {}
+        mic_reopen_on = os.environ.get("MVG_ENABLE_MIC_REOPEN", "0").strip().lower() in ("1", "true", "yes", "on")
 
         segmenter = SentenceSegmenter(early_first=FIRST_CLAUSE_EARLY)
         wake = threading.Event()  # set when a sentence is queued or the brain finishes
@@ -3144,7 +3468,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 transcript_rec["prompt"] = prompt
                 transcript_rec["transcript"] = prompt
                 transcript_rec["reply"] = reply
-                transcript_rec["expects_reply"] = reply_expects_reply(reply)
+                if mic_reopen_on:
+                    transcript_rec["expects_reply"] = reply_expects_reply(reply)
                 emit_turn_transcript(transcript_rec)
 
         def _emit_gap_fill(categories, fallback=()) -> bool:
@@ -3289,7 +3614,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 # gate, before the brain. A miss / error / slow handler falls
                 # through to the brain below, unchanged.
                 has_vision = bool(ctx.get("image_b64") or ctx.get("burst_images_b64"))
-                fast = opts.get("intent_result") or _intent(prompt, has_images=has_vision)
+                ha_auth = opts.get("ha_authorized")
+                if ha_auth is None:
+                    auth_header = (
+                        self.headers.get("Authorization", "")
+                        if hasattr(self, "headers") and self.headers
+                        else ""
+                    )
+                    ha_auth = _is_ha_authorized(
+                        auth_header=auth_header,
+                        node_id=node_id,
+                        speaker=speaker,
+                        speaker_score=speaker_score,
+                        voice_id=ctx.get("voice_id"),
+                        claimed_speaker=ctx.get("claimed_speaker", ""),
+                    )
+                fast = opts.get("intent_result") or _intent(
+                    prompt, has_images=has_vision, ha_authorized=ha_auth
+                )
                 intent_rec["intent_match_ms"] = fast["match_ms"]
                 intent_rec["intent_handler_ms"] = fast["handler_ms"]
                 if fast["hit"]:
@@ -3441,6 +3783,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 reply = strip_markdown(raw)
                 if os.environ.get("MVG_ARTIFACT_WEBHOOK_URL"):
                     reply, _ = forward_artifacts_to_webhook(raw, reply)
+                if is_defer_enabled() and (has_defer_marker(raw) or has_defer_marker(reply)):
+                    get_pending_store().store(
+                        node_id=node_id,
+                        prompt=prompt,
+                        answer=strip_defer_marker(reply),
+                    )
                 reply = strip_defer_marker(reply)
                 # Only a real answer opens the follow-up window for
                 # /ambient — same rule as /ask (see its own comment above).
@@ -3477,16 +3825,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                       "is_final": True, "data": "",
                                       "sample_rate": AUDIO_TARGET_RATE,
                                       "channels": AUDIO_TARGET_CHANNELS})
-        expects = reply_expects_reply(reply)
         if voice:
-            self._sse("reply", {"reply": reply, "text": reply,
-                                "tts_engine": timing["engine"] or ("text" if text_mode else "wav"),
-                                "expects_reply": expects})
-            self._sse("done", {"duration_ms": int((time.time() - t0) * 1000),
-                               "expects_reply": expects})
+            reply_ev = {"reply": reply, "text": reply,
+                        "tts_engine": timing["engine"] or ("text" if text_mode else "wav")}
+            done_ev = {"duration_ms": int((time.time() - t0) * 1000)}
         else:
-            self._sse("reply", {"reply": reply, "expects_reply": expects})
-            self._sse("done", {"expects_reply": expects})
+            reply_ev = {"reply": reply}
+            done_ev = {}
+        if mic_reopen_on:
+            expects = reply_expects_reply(reply)
+            reply_ev["expects_reply"] = expects
+            done_ev["expects_reply"] = expects
+        self._sse("reply", reply_ev)
+        self._sse("done", done_ev)
         _finish(outcome, with_node=True)
         return (outcome, reply)
 
@@ -3518,20 +3869,6 @@ class GatewayHandler(BaseHTTPRequestHandler):
         elif content_type in ("audio/wav", "application/octet-stream", ""):
             wav_bytes = body
 
-        if enable_adpcm and wav_bytes:
-            try:
-                wav_bytes = decode_adpcm_to_wav(wav_bytes)
-            except ValueError as exc:
-                self._send_json(413, {"error": "payload_too_large", "detail": str(exc)})
-                log_request("/voice/turn", (time.time() - t0) * 1000, "error:adpcm_too_large")
-                return
-
-        if enable_vision and not image_bytes and not burst_images and qs:
-            image_bytes, burst_images = extract_vision_payloads({k: v[0] for k, v in qs.items() if v})
-
-        image_b64 = base64.b64encode(image_bytes).decode("ascii") if image_bytes else None
-        burst_images_b64 = [base64.b64encode(b).decode("ascii") for b in burst_images] if burst_images else []
-
         def opt(name: str):
             """Multipart field first, then the query string; None if absent."""
             if name in fields:
@@ -3555,13 +3892,27 @@ class GatewayHandler(BaseHTTPRequestHandler):
         node_id = forced_node or requested_node
         _set_req_node(node_id)
 
-        verifier = get_device_token_verifier()
-        if verifier.is_enabled:
-            auth_header = self.headers.get("Authorization", "")
-            if not verifier.verify(auth_header, node_id):
-                self._send_json(401, {"error": "unauthorized"})
-                log_request("/voice/turn", (time.time() - t0) * 1000, "error:unauthorized", node=node_id)
+        if not self._check_bearer_auth(node_id, "/voice/turn", t0):
+            return
+
+        if enable_adpcm and wav_bytes:
+            try:
+                wav_bytes = decode_adpcm_to_wav(wav_bytes)
+            except ValueError as exc:
+                self._send_json(413, {"error": "payload_too_large", "detail": str(exc)})
+                log_request("/voice/turn", (time.time() - t0) * 1000, "error:adpcm_too_large", node=node_id)
                 return
+
+        if enable_vision and not image_bytes and not burst_images and qs:
+            image_bytes, burst_images = extract_vision_payloads({k: v[0] for k, v in qs.items() if v})
+
+        if enable_vision and image_bytes and not is_valid_image_bytes(image_bytes):
+            self._send_json(400, {"error": "invalid image format (must be JPEG, PNG, or WEBP)"})
+            log_request("/voice/turn", (time.time() - t0) * 1000, "error:invalid_image", node=node_id)
+            return
+
+        image_b64 = base64.b64encode(image_bytes).decode("ascii") if image_bytes else None
+        burst_images_b64 = [base64.b64encode(b).decode("ascii") for b in burst_images] if burst_images else []
 
         if not node_id:
             self._send_json(400, {"error": "node_id required"})
@@ -3603,26 +3954,35 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if not self._sse("turn", {"turn_id": turn_id, "node_id": node_id}):
             return
 
-        def end(outcome: str, **extra) -> None:
+        stt_box: dict[str, Any] = {}
+        transcript: str = ""
+        spoken_reply: str = ""
+
+        def end(outcome: str, reply: str = "", **extra) -> None:
             log_request("/voice/turn", (time.time() - t0) * 1000, outcome,
                         **{**log_extra, **extra})
             if os.environ.get("MVG_TRANSCRIPT_SINK_URL") or os.environ.get("MVG_TRANSCRIPT_LOG_PATH"):
-                curr_tx = stt_box.get("text", "") if "stt_box" in locals() and isinstance(stt_box, dict) else (transcript if "transcript" in locals() else "")
-                emit_turn_transcript({
+                prompt_text = extra.pop("prompt", None) or extra.pop("transcript", None) or transcript or stt_box.get("text", "")
+                final_reply = reply or extra.pop("reply", "") or spoken_reply
+                mic_reopen_on = os.environ.get("MVG_ENABLE_MIC_REOPEN", "0").strip().lower() in ("1", "true", "yes", "on")
+                tr_entry: dict[str, Any] = {
                     "kind": "turn",
                     "endpoint": "/voice/turn",
                     "node_id": node_id or None,
                     "session_id": session_id or None,
                     "turn_id": turn_id,
-                    "prompt": curr_tx or "",
-                    "transcript": curr_tx or "",
-                    "reply": "",
+                    "prompt": prompt_text or "",
+                    "transcript": prompt_text or "",
+                    "reply": final_reply or "",
                     "outcome": outcome,
                     "total_ms": round((time.time() - t0) * 1000, 1),
                     "timestamp": time.time(),
                     **log_extra,
                     **extra,
-                })
+                }
+                if mic_reopen_on and final_reply:
+                    tr_entry["expects_reply"] = reply_expects_reply(final_reply)
+                emit_turn_transcript(tr_entry)
 
         # 1 + 2. Speech gate || transcribe || identify. All three start together so
         # the gate (~1.3 s on slow hardware) adds no latency; a rejected clip just
@@ -3634,7 +3994,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 id_box["r"] = identify_speaker_detail(wav_bytes, sha)
             id_thread = threading.Thread(target=_id_worker, daemon=True)
             id_thread.start()
-        stt_box: dict = {}
+        stt_box.clear()
         t_stt = time.time()
 
         def _stt_worker():
@@ -3809,6 +4169,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def _handle_embed(self):
         t0 = time.time()
+        node_id = (self.headers.get("X-Node-Id") or
+                   (parse_qs(urlsplit(self.path).query).get("node_id") or [""])[0]).strip()
+        if not self._check_bearer_auth(node_id, "/embed", t0):
+            return
         wav_bytes = self._read_body()
         if not wav_bytes:
             self._send_json(400, {"error": "no audio payload found"})
