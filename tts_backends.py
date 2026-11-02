@@ -26,6 +26,7 @@ DEFAULT_GEMINI_VOICE = "Schedar"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-preview-tts"
 DEFAULT_KOKORO_VOICE = "af_heart"
 DEFAULT_KOKORO_URL = "http://127.0.0.1:8880/v1/audio/speech"
+MAX_TTS_RESPONSE_BYTES = int(os.environ.get("MVG_MAX_TTS_RESPONSE_BYTES") or 25 * 1024 * 1024)
 
 
 def _post_wav(url: str, data: bytes, headers: dict, timeout: float) -> bytes:
@@ -33,9 +34,11 @@ def _post_wav(url: str, data: bytes, headers: dict, timeout: float) -> bytes:
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         status = getattr(resp, "status", 200)
-        body = resp.read()
+        body = resp.read(MAX_TTS_RESPONSE_BYTES + 1)
     if not 200 <= status < 300:
         raise RuntimeError(f"tts HTTP {status}")
+    if len(body) > MAX_TTS_RESPONSE_BYTES:
+        raise RuntimeError(f"tts response exceeded maximum size ({MAX_TTS_RESPONSE_BYTES} bytes)")
     if not body or not body.startswith(b"RIFF"):
         raise RuntimeError(f"tts returned a non-WAV body ({len(body or b'')} bytes)")
     return body
@@ -240,10 +243,14 @@ class GeminiTTSBackend:
         req = urllib.request.Request(self.url, data=body, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             status = getattr(resp, "status", 200)
-            resp_bytes = resp.read()
+            resp_bytes = resp.read(MAX_TTS_RESPONSE_BYTES + 1)
 
         if not 200 <= status < 300:
             raise RuntimeError(f"gemini tts HTTP {status}")
+        if len(resp_bytes) > MAX_TTS_RESPONSE_BYTES:
+            raise RuntimeError(
+                f"gemini tts response exceeded maximum size ({MAX_TTS_RESPONSE_BYTES} bytes)"
+            )
 
         data = json.loads(resp_bytes.decode("utf-8"))
         pcm_chunks = []
@@ -281,7 +288,7 @@ class KokoroTTSBackend:
     Env: MVG_KOKORO_URL (default http://127.0.0.1:8880/v1/audio/speech),
     MVG_KOKORO_VOICE (default af_heart),
     MVG_KOKORO_MODEL (default kokoro),
-    MVG_KOKORO_API_KEY (optional bearer token).
+    MVG_KOKORO_API_KEY or MVG_KOKORO_KEY (optional bearer token).
     Posts {"model": "kokoro", "input": text, "voice": voice, "response_format": "pcm"}.
     """
 
@@ -342,7 +349,7 @@ class KokoroTTSBackend:
         return (
             self._api_key
             or os.environ.get("MVG_KOKORO_API_KEY")
-            or os.environ.get("MVG_OPENAI_TTS_KEY")
+            or os.environ.get("MVG_KOKORO_KEY")
             or ""
         )
 
@@ -374,17 +381,47 @@ class KokoroTTSBackend:
             status = getattr(resp, "status", 200)
             if not 200 <= status < 300:
                 raise RuntimeError(f"kokoro tts HTTP {status}")
+            total_read = 0
             while True:
                 chunk = resp.read(chunk_size)
                 if not chunk:
                     break
+                total_read += len(chunk)
+                if total_read > MAX_TTS_RESPONSE_BYTES:
+                    raise RuntimeError(
+                        f"kokoro tts response exceeded maximum size ({MAX_TTS_RESPONSE_BYTES} bytes)"
+                    )
                 yield chunk
 
     def synthesize(self, text: str, voice: Optional[str] = None) -> bytes:
         """Synthesize text into raw 24 kHz 16-bit mono PCM bytes."""
-        chunks = list(self.synthesize_stream(text, voice=voice))
-        raw = b"".join(chunks)
-        return extract_pcm_from_wav_or_raw(raw)
+        url = self.url
+        if not url:
+            raise RuntimeError("MVG_KOKORO_URL not set")
+
+        payload = {
+            "model": self.model,
+            "input": text,
+            "voice": voice or self.voice,
+            "response_format": "pcm",
+        }
+        body = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            status = getattr(resp, "status", 200)
+            if not 200 <= status < 300:
+                raise RuntimeError(f"kokoro tts HTTP {status}")
+            resp_bytes = resp.read(MAX_TTS_RESPONSE_BYTES + 1)
+
+        if len(resp_bytes) > MAX_TTS_RESPONSE_BYTES:
+            raise RuntimeError(
+                f"kokoro tts response exceeded maximum size ({MAX_TTS_RESPONSE_BYTES} bytes)"
+            )
+        return extract_pcm_from_wav_or_raw(resp_bytes)
 
     def __call__(self, text: str) -> bytes:
         return self.synthesize(text)
@@ -405,12 +442,13 @@ def get_backend(name: Optional[str] = None, *, instantiate: bool = True, **kwarg
     """Factory resolution for TTS backends.
 
     Resolves backend by name (defaulting to MVG_TTS environment variable).
-    Returns an instance of the backend class (or class if instantiate=False).
+    Returns an instance of the backend class (or class if instantiate=False),
+    or None if name / MVG_TTS is unset or empty.
     """
     if name is None:
-        name = os.environ.get("MVG_TTS", "").strip().lower()
-    if not name:
-        name = "kokoro"
+        name = os.environ.get("MVG_TTS", "").strip()
+    if not name or name.lower() in ("none", "off", "0", "false"):
+        return None
     name = name.strip().lower()
     backend = BACKENDS.get(name)
     if backend is None:
