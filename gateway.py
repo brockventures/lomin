@@ -181,6 +181,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
@@ -2989,16 +2990,22 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 # as "the agent is mid-conversation" on this node.
                 record_reply(node_id, reply)
 
-        expects = reply_expects_reply(reply)
+        mic_reopen_on = os.environ.get("MVG_ENABLE_MIC_REOPEN", "0").strip().lower() in ("1", "true", "yes", "on")
+        reply_dict: dict[str, Any] = {"reply": reply}
+        done_dict: dict[str, Any] = {}
+        if mic_reopen_on:
+            expects = reply_expects_reply(reply)
+            reply_dict["expects_reply"] = expects
+            done_dict["expects_reply"] = expects
         try:
-            self.wfile.write(self._sse_event("reply", {"reply": reply, "expects_reply": expects}))
-            self.wfile.write(self._sse_event("done", {"expects_reply": expects}))
+            self.wfile.write(self._sse_event("reply", reply_dict))
+            self.wfile.write(self._sse_event("done", done_dict))
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass
         log_request("/ask", (time.time() - t0) * 1000, outcome, node_id=node_id)
         if os.environ.get("MVG_TRANSCRIPT_SINK_URL") or os.environ.get("MVG_TRANSCRIPT_LOG_PATH"):
-            emit_turn_transcript({
+            tr_rec: dict[str, Any] = {
                 "kind": "ask",
                 "endpoint": "/ask",
                 "node_id": node_id or None,
@@ -3006,10 +3013,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "transcript": prompt,
                 "reply": reply,
                 "outcome": outcome,
-                "expects_reply": expects,
                 "total_ms": round((time.time() - t0) * 1000, 1),
                 "timestamp": time.time(),
-            })
+            }
+            if mic_reopen_on:
+                tr_rec["expects_reply"] = reply_expects_reply(reply)
+            emit_turn_transcript(tr_rec)
 
     # -- /ask/stream (SSE, MANDOS) --
     #
@@ -3201,6 +3210,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         voice = bool(opts.get("voice"))
         audio_chunk = bool(opts.get("audio_chunk"))
         log_extra = log_extra or {}
+        mic_reopen_on = os.environ.get("MVG_ENABLE_MIC_REOPEN", "0").strip().lower() in ("1", "true", "yes", "on")
 
         segmenter = SentenceSegmenter(early_first=FIRST_CLAUSE_EARLY)
         wake = threading.Event()  # set when a sentence is queued or the brain finishes
@@ -3341,7 +3351,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 transcript_rec["prompt"] = prompt
                 transcript_rec["transcript"] = prompt
                 transcript_rec["reply"] = reply
-                transcript_rec["expects_reply"] = reply_expects_reply(reply)
+                if mic_reopen_on:
+                    transcript_rec["expects_reply"] = reply_expects_reply(reply)
                 emit_turn_transcript(transcript_rec)
 
         def _emit_gap_fill(categories, fallback=()) -> bool:
@@ -3691,16 +3702,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                       "is_final": True, "data": "",
                                       "sample_rate": AUDIO_TARGET_RATE,
                                       "channels": AUDIO_TARGET_CHANNELS})
-        expects = reply_expects_reply(reply)
         if voice:
-            self._sse("reply", {"reply": reply, "text": reply,
-                                "tts_engine": timing["engine"] or ("text" if text_mode else "wav"),
-                                "expects_reply": expects})
-            self._sse("done", {"duration_ms": int((time.time() - t0) * 1000),
-                               "expects_reply": expects})
+            reply_ev = {"reply": reply, "text": reply,
+                        "tts_engine": timing["engine"] or ("text" if text_mode else "wav")}
+            done_ev = {"duration_ms": int((time.time() - t0) * 1000)}
         else:
-            self._sse("reply", {"reply": reply, "expects_reply": expects})
-            self._sse("done", {"expects_reply": expects})
+            reply_ev = {"reply": reply}
+            done_ev = {}
+        if mic_reopen_on:
+            expects = reply_expects_reply(reply)
+            reply_ev["expects_reply"] = expects
+            done_ev["expects_reply"] = expects
+        self._sse("reply", reply_ev)
+        self._sse("done", done_ev)
         _finish(outcome, with_node=True)
         return (outcome, reply)
 
@@ -3817,26 +3831,35 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if not self._sse("turn", {"turn_id": turn_id, "node_id": node_id}):
             return
 
-        def end(outcome: str, **extra) -> None:
+        stt_box: dict[str, Any] = {}
+        transcript: str = ""
+        spoken_reply: str = ""
+
+        def end(outcome: str, reply: str = "", **extra) -> None:
             log_request("/voice/turn", (time.time() - t0) * 1000, outcome,
                         **{**log_extra, **extra})
             if os.environ.get("MVG_TRANSCRIPT_SINK_URL") or os.environ.get("MVG_TRANSCRIPT_LOG_PATH"):
-                curr_tx = stt_box.get("text", "") if "stt_box" in locals() and isinstance(stt_box, dict) else (transcript if "transcript" in locals() else "")
-                emit_turn_transcript({
+                prompt_text = extra.pop("prompt", None) or extra.pop("transcript", None) or transcript or stt_box.get("text", "")
+                final_reply = reply or extra.pop("reply", "") or spoken_reply
+                mic_reopen_on = os.environ.get("MVG_ENABLE_MIC_REOPEN", "0").strip().lower() in ("1", "true", "yes", "on")
+                tr_entry: dict[str, Any] = {
                     "kind": "turn",
                     "endpoint": "/voice/turn",
                     "node_id": node_id or None,
                     "session_id": session_id or None,
                     "turn_id": turn_id,
-                    "prompt": curr_tx or "",
-                    "transcript": curr_tx or "",
-                    "reply": "",
+                    "prompt": prompt_text or "",
+                    "transcript": prompt_text or "",
+                    "reply": final_reply or "",
                     "outcome": outcome,
                     "total_ms": round((time.time() - t0) * 1000, 1),
                     "timestamp": time.time(),
                     **log_extra,
                     **extra,
-                })
+                }
+                if mic_reopen_on and final_reply:
+                    tr_entry["expects_reply"] = reply_expects_reply(final_reply)
+                emit_turn_transcript(tr_entry)
 
         # 1 + 2. Speech gate || transcribe || identify. All three start together so
         # the gate (~1.3 s on slow hardware) adds no latency; a rejected clip just
@@ -3848,7 +3871,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 id_box["r"] = identify_speaker_detail(wav_bytes, sha)
             id_thread = threading.Thread(target=_id_worker, daemon=True)
             id_thread.start()
-        stt_box: dict = {}
+        stt_box.clear()
         t_stt = time.time()
 
         def _stt_worker():

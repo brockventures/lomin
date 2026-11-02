@@ -173,6 +173,13 @@ Every variable below is also listed, commented, in `.env.example`. Secrets have 
 | `MVG_ENABLE_VISION` / `MVG_VISION_ENABLED` | `0` — `1` enables multimodal camera frame ingest (`image`, `image_b64`, `burst_images_b64`, max 5 MiB) on `/voice/turn` |
 | `MVG_ENABLE_ADPCM` / `MVG_ADPCM_ENABLED` | `0` — `1` enables BLE 4-bit IMA ADPCM audio decode (`APCM` header -> 16 kHz PCM WAV, max 512 KiB) on `/voice/turn` |
 | `MVG_VISION_ADPCM` | `0` — `1` convenience alias enabling both vision frames and ADPCM decode |
+| `MVG_ENABLE_MIC_REOPEN` | `0` — `1` enables opt-in auto mic reopening by including `expects_reply` (boolean detected via question cues and punctuation) in `/ask` and `/ask/stream` SSE `reply` and `done` payloads |
+| `MVG_ARTIFACT_WEBHOOK_URL` | unset — HTTP/HTTPS webhook URL to post replies containing URLs or markdown code blocks asynchronously via a background daemon queue without delaying TTS voice replies |
+| `MVG_TRANSCRIPT_SINK_URL` | unset — HTTP/HTTPS sink URL to receive completed turn transcript records asynchronously with validated URL schemes and no cross-scheme redirect downgrade |
+| `MVG_TRANSCRIPT_AUTH_TOKEN` | unset — bearer token sent as `Authorization: Bearer <token>` with requests to `MVG_TRANSCRIPT_SINK_URL` |
+| `MVG_TRANSCRIPT_LOG_PATH` | unset — file path to append turn transcript JSONL records with strict `0o600` permissions and automated rotation |
+| `MVG_TRANSCRIPT_MAX_BYTES` | `10485760` (10 MiB) — size cap for `MVG_TRANSCRIPT_LOG_PATH` before rotating the log file to `.1` |
+| `MVG_SIDE_CHANNEL_QUEUE_SIZE` | `1000` — maximum bounded task capacity for the background side-channel webhook and transcript worker queue |
 | `MVG_PLUGIN` | unset — module name of the plugin (see "Plugin") |
 | `MVG_BRAIN` | `plugin` when the plugin has `brain_call`, else `http` — `plugin` or `http` |
 | `MVG_BRAIN_URL` | unset (required for `http`) — endpoint the `http` brain POSTs to |
@@ -1020,3 +1027,22 @@ Deploy: nothing is installed by this change. On the gateway host, `git pull` (th
 gitops cycle) then restart `lomin.service`; `intents/` must
 ship with `gateway.py`. Check `logs/voice-latency.jsonl` for `intent` fields and
 run `voice-latency-report.py --since 1d`.
+
+## Side-Channel Webhooks, Transcripts & Mic Reopen
+
+Lomin supports non-blocking side-channel notifications, turn transcript streaming, and opt-in question-driven microphone reopening (`side_channel.py`).
+
+### Opt-In Auto Mic Reopen (`MVG_ENABLE_MIC_REOPEN`)
+- **Default:** `0` (disabled). When disabled, `/ask` and `/ask/stream` SSE `reply` and `done` payloads remain strictly unmodified to preserve compatibility with existing nodes and clients.
+- **Enabled (`MVG_ENABLE_MIC_REOPEN=1`):** Inspects the final spoken reply with `reply_expects_reply()`. If the reply ends with a question mark (accounting for whitespace, quotes, and emoji ornaments), the gateway attaches `"expects_reply": true` to the SSE `reply` and `done` events, indicating to the client device that its microphone should immediately reopen for a follow-up answer.
+
+### Side-Channel Artifact Webhooks (`MVG_ARTIFACT_WEBHOOK_URL`)
+- When configured, raw replies are checked for URLs (`https?://...`) and Markdown code blocks (```` ```...``` ````).
+- If artifacts are detected, the spoken reply is augmented with a verbal cue ("*I sent the link to Discord.*") unless already cued.
+- The full artifact payload is queued to a bounded background daemon worker queue (`MVG_SIDE_CHANNEL_QUEUE_SIZE`, default 1000) and dispatched asynchronously via HTTP/HTTPS POST, ensuring slow or unreachable webhooks never add latency to speech synthesis or playback.
+
+### Turn Transcripts (`MVG_TRANSCRIPT_SINK_URL` and `MVG_TRANSCRIPT_LOG_PATH`)
+- Turn records (including prompt, spoken reply, timing metrics, and node ID) are exported asynchronously via background worker queue.
+- **HTTP/HTTPS Sink (`MVG_TRANSCRIPT_SINK_URL`):** Dispatches JSON turn records. Validates URL schemes (only `http` and `https` permitted) and blocks insecure cross-scheme redirect downgrades. Supports optional bearer authorization via `MVG_TRANSCRIPT_AUTH_TOKEN`.
+- **JSONL File Sink (`MVG_TRANSCRIPT_LOG_PATH`):** Appends turn records to a local JSONL file with strict `0o600` permissions (`-rw-------`). Automatically rotates the active log file to `.1` when size exceeds `MVG_TRANSCRIPT_MAX_BYTES` (default 10 MiB).
+
