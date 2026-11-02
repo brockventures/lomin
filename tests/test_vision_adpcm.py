@@ -209,9 +209,9 @@ def test_extract_vision_payloads_single_image():
 
 
 def test_extract_vision_payloads_burst_frames():
-    f0 = b"frame-0-bytes"
-    f1 = b"frame-1-bytes"
-    f2 = b"frame-2-bytes"
+    f0 = b"\xff\xd8\xff" + b"frame-0-bytes"
+    f1 = b"\xff\xd8\xff" + b"frame-1-bytes"
+    f2 = b"\xff\xd8\xff" + b"frame-2-bytes"
 
     # Numbered fields image_0 .. image_2
     img, burst = extract_vision_payloads({"image_0": f0, "image_1": f1, "image_2": f2})
@@ -231,9 +231,9 @@ def test_extract_vision_payloads_burst_frames():
 
 
 def test_extract_vision_payloads_combined_single_and_burst():
-    main_img = b"main-camera-frame"
-    burst0 = b"burst-frame-0"
-    burst1 = b"burst-frame-1"
+    main_img = b"\xff\xd8\xff" + b"main-camera-frame"
+    burst0 = b"\xff\xd8\xff" + b"burst-frame-0"
+    burst1 = b"\xff\xd8\xff" + b"burst-frame-1"
 
     img, burst = extract_vision_payloads({"image": main_img, "image_0": burst0, "image_1": burst1})
     assert img == main_img
@@ -271,10 +271,10 @@ def test_extract_vision_payloads_validation():
     assert burst == []
 
     # burst_images_b64 filters out non-string and non-base64 items
-    valid_b64 = base64.b64encode(b"frame1").decode("ascii")
+    valid_b64 = base64.b64encode(b"\xff\xd8\xff" + b"frame1").decode("ascii")
     img, burst = extract_vision_payloads({"burst_images_b64": [valid_b64, "invalid_b64!", 12345]})
     assert img is None
-    assert burst == [b"frame1"]
+    assert burst == [b"\xff\xd8\xff" + b"frame1"]
 
 
 # ============================================================================
@@ -373,8 +373,8 @@ def test_voice_turn_multimodal_camera_multipart(server, monkeypatch):
     monkeypatch.setattr(gateway, "STREAM_BRAIN_CALL", recorder)
 
     test_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-TEST-IMAGE"
-    burst_f0 = b"burst-frame-0-jpeg"
-    burst_f1 = b"burst-frame-1-jpeg"
+    burst_f0 = b"\xff\xd8\xff" + b"burst-frame-0-jpeg"
+    burst_f1 = b"\xff\xd8\xff" + b"burst-frame-1-jpeg"
 
     expected_img_b64 = base64.b64encode(test_jpeg).decode("ascii")
     expected_b0_b64 = base64.b64encode(burst_f0).decode("ascii")

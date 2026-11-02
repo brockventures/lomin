@@ -1943,160 +1943,29 @@ MVG_BRAIN_URL = os.environ.get("MVG_BRAIN_URL", "")
 MVG_BRAIN_TOKEN = os.environ.get("MVG_BRAIN_TOKEN", "")
 
 
-def consume_brain_sse_lines(lines, on_partial=None, max_stream_seconds: float | None = None) -> str:
-    """Consume Server-Sent Events (SSE) lines from an HTTP brain stream.
+from streaming_brain import consume_brain_sse_lines as _sb_consume_brain_sse_lines
 
-    Supports SSE `event: sentence`, `event: delta`, and `event: reply`
-    (with JSON {"text": ...} or {"reply": ...}) as well as OpenAI-style
-    `data: {"choices": [{"delta": {"content": ...}}]}` lines.
-    Calls `on_partial(accumulated_text)` as each text chunk arrives.
-    Enforces MAX_SSE_CHARS char ceiling and max_stream_seconds total deadline.
-    Returns the final reply string.
-    """
-    current_event = ""
-    chunks: list[str] = []
-    current_len = 0
-    final_reply = ""
-    start_time = time.monotonic()
 
-    for raw_line in lines:
-        if max_stream_seconds is not None and (time.monotonic() - start_time) > max_stream_seconds:
-            break
-
-        if isinstance(raw_line, (bytes, bytearray)):
-            line = raw_line.decode("utf-8", errors="replace")
-        else:
-            line = str(raw_line)
-
-        line = line.rstrip("\r\n")
-
-        if not line:
-            current_event = ""
-            continue
-
-        if line.startswith(":"):
-            continue
-
-        if line.startswith("event:"):
-            current_event = line[6:].strip()
-            continue
-
-        if line.startswith("data:"):
-            data_str = line[5:].strip()
-            if not data_str or data_str == "[DONE]":
-                continue
-
-            try:
-                payload = json.loads(data_str)
-            except Exception:
-                payload = data_str
-
-            if isinstance(payload, dict) and "choices" in payload:
-                choices = payload.get("choices")
-                if isinstance(choices, list) and choices:
-                    c0 = choices[0]
-                    if isinstance(c0, dict):
-                        delta = c0.get("delta")
-                        if isinstance(delta, dict):
-                            content = delta.get("content")
-                            if isinstance(content, str) and content:
-                                if current_len + len(content) > MAX_SSE_CHARS:
-                                    allowed = max(0, MAX_SSE_CHARS - current_len)
-                                    if allowed > 0:
-                                        chunks.append(content[:allowed])
-                                        current_len += allowed
-                                        if on_partial:
-                                            on_partial("".join(chunks))
-                                    break
-                                chunks.append(content)
-                                current_len += len(content)
-                                if on_partial:
-                                    on_partial("".join(chunks))
-                                continue
-
-            chunk = ""
-            if isinstance(payload, dict):
-                if current_event == "reply":
-                    chunk = payload.get("reply") or payload.get("text") or ""
-                elif current_event == "sentence":
-                    chunk = payload.get("text") or payload.get("reply") or ""
-                elif current_event == "delta":
-                    chunk = payload.get("text") or payload.get("delta") or payload.get("reply") or ""
-                else:
-                    if "reply" in payload and not ("text" in payload or "delta" in payload):
-                        chunk = payload["reply"]
-                        final_reply = chunk
-                    elif "text" in payload:
-                        chunk = payload["text"]
-                    elif "delta" in payload:
-                        chunk = payload["delta"]
-                    else:
-                        chunk = payload.get("reply") or ""
-            elif isinstance(payload, str):
-                chunk = payload
-
-            if not isinstance(chunk, str) or not chunk:
-                continue
-
-            if current_event == "reply":
-                final_reply = chunk
-                if len(chunk) > MAX_SSE_CHARS:
-                    chunk = chunk[:MAX_SSE_CHARS]
-                chunks = [chunk]
-                current_len = len(chunk)
-                if on_partial:
-                    on_partial(chunk)
-            elif current_event == "sentence":
-                sep = ""
-                if chunks and not chunks[-1].endswith((" ", "\n")) and not chunk.startswith(" "):
-                    sep = " "
-                to_add = sep + chunk if sep else chunk
-                if current_len + len(to_add) > MAX_SSE_CHARS:
-                    allowed = max(0, MAX_SSE_CHARS - current_len)
-                    if allowed > 0:
-                        chunks.append(to_add[:allowed])
-                        current_len += allowed
-                        if on_partial:
-                            on_partial("".join(chunks))
-                    break
-                chunks.append(to_add)
-                current_len += len(to_add)
-                if on_partial:
-                    on_partial("".join(chunks))
-            elif current_event == "delta":
-                to_add = chunk
-                if current_len + len(to_add) > MAX_SSE_CHARS:
-                    allowed = max(0, MAX_SSE_CHARS - current_len)
-                    if allowed > 0:
-                        chunks.append(to_add[:allowed])
-                        current_len += allowed
-                        if on_partial:
-                            on_partial("".join(chunks))
-                    break
-                chunks.append(to_add)
-                current_len += len(to_add)
-                if on_partial:
-                    on_partial("".join(chunks))
-            else:
-                if final_reply and "".join(chunks) == chunk:
-                    if on_partial:
-                        on_partial("".join(chunks))
-                else:
-                    to_add = chunk
-                    if current_len + len(to_add) > MAX_SSE_CHARS:
-                        allowed = max(0, MAX_SSE_CHARS - current_len)
-                        if allowed > 0:
-                            chunks.append(to_add[:allowed])
-                            current_len += allowed
-                            if on_partial:
-                                on_partial("".join(chunks))
-                        break
-                    chunks.append(to_add)
-                    current_len += len(to_add)
-                    if on_partial:
-                        on_partial("".join(chunks))
-
-    return final_reply if final_reply else "".join(chunks)
+def consume_brain_sse_lines(
+    lines,
+    on_partial=None,
+    max_stream_seconds: float | None = None,
+    max_chars: int | None = None,
+    read_timeout: float | None = None,
+    incremental: bool = True,
+) -> str:
+    """Consume Server-Sent Events (SSE) lines from an HTTP brain stream via streaming_brain."""
+    eff_max_chars = MAX_SSE_CHARS if max_chars is None else max_chars
+    eff_read_timeout = max_stream_seconds if read_timeout is None else read_timeout
+    return _sb_consume_brain_sse_lines(
+        lines,
+        on_partial=on_partial,
+        max_chars=eff_max_chars,
+        read_timeout=eff_read_timeout,
+        max_stream_seconds=max_stream_seconds,
+        raise_on_timeout=False,
+        incremental=incremental,
+    )
 
 
 def build_http_brain_body(prompt: str, session_id: str, node_id: str, speaker: str,
@@ -3906,10 +3775,27 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if enable_vision and not image_bytes and not burst_images and qs:
             image_bytes, burst_images = extract_vision_payloads({k: v[0] for k, v in qs.items() if v})
 
-        if enable_vision and image_bytes and not is_valid_image_bytes(image_bytes):
-            self._send_json(400, {"error": "invalid image format (must be JPEG, PNG, or WEBP)"})
-            log_request("/voice/turn", (time.time() - t0) * 1000, "error:invalid_image", node=node_id)
-            return
+        if enable_vision:
+            _bad_img = False
+            if image_bytes and not is_valid_image_bytes(image_bytes):
+                _bad_img = True
+            elif burst_images and any(not is_valid_image_bytes(b) for b in burst_images):
+                _bad_img = True
+            elif content_type.startswith("multipart/form-data"):
+                for _k in ("image", "image_0", "image_1", "image_2", "image_3", "image_4", "burst_images"):
+                    if _k in parts and parts[_k]:
+                        _pv = parts[_k]
+                        if isinstance(_pv, (list, tuple)):
+                            if any(not is_valid_image_bytes(x) for x in _pv if x):
+                                _bad_img = True
+                                break
+                        elif not is_valid_image_bytes(_pv):
+                            _bad_img = True
+                            break
+            if _bad_img:
+                self._send_json(400, {"error": "invalid image format (must be JPEG, PNG, or WEBP)"})
+                log_request("/voice/turn", (time.time() - t0) * 1000, "error:invalid_image", node=node_id)
+                return
 
         image_b64 = base64.b64encode(image_bytes).decode("ascii") if image_bytes else None
         burst_images_b64 = [base64.b64encode(b).decode("ascii") for b in burst_images] if burst_images else []
