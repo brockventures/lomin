@@ -56,7 +56,7 @@ def try_ha_conversation(
         (False, '', meta) when disabled, vision turn, no intent matched,
         or on network/HTTP errors.
     """
-    eff_enabled = (os.environ.get("MVG_HA_ENABLED", "0") == "1") if enabled is None else bool(enabled)
+    eff_enabled = (os.environ.get("MVG_HA_ENABLED", "0") == "1" or os.environ.get("MVG_HA_FASTPATH", "0") == "1") if enabled is None else bool(enabled)
     if not eff_enabled or has_images:
         return False, "", {"reason": "disabled_or_vision"}
 
