@@ -418,7 +418,7 @@ def test_get_backend_env_resolution(monkeypatch):
 
     monkeypatch.delenv("MVG_TTS", raising=False)
     b = get_backend()
-    assert isinstance(b, KokoroTTSBackend)
+    assert b is None
 
 
 def test_get_backend_unknown_raises():

@@ -217,7 +217,7 @@ def consume_brain_sse_lines(
     start_time = time.monotonic()
 
     def _get_accumulated() -> str:
-        return final_reply if final_reply else accumulated
+        return (final_reply[:max_chars] if max_chars else final_reply) if final_reply else (accumulated[:max_chars] if max_chars else accumulated)
 
     def _emit_partial(new_acc: str, delta: str) -> None:
         if on_partial is None:
@@ -339,7 +339,7 @@ def consume_brain_sse_lines(
             if is_reply_event or current_event == "reply":
                 if len(chunk) > max_chars:
                     chunk = chunk[:max_chars]
-                final_reply = chunk
+                final_reply = chunk[:max_chars] if max_chars else chunk
                 accumulated = chunk
                 current_len = len(chunk)
                 _emit_partial(accumulated, chunk)
