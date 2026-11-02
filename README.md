@@ -1089,3 +1089,5 @@ When `MVG_ENABLE_DEFER=1`, the gateway supports deferred asynchronous voice repl
   - `GET /voice/pending?node=<node>&pop=1`: Retrieves and pops the oldest pending answer for the node.
   - `POST /voice/pending`: Stores an asynchronous answer directly into the pending queue for subsequent voice delivery.
 
+
+- **Request Validation:** Malformed JSON bodies on `/ask` and `/ask/stream` return `400 Bad Request` (`{"error": "invalid JSON body"}`).
