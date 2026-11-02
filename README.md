@@ -40,21 +40,42 @@ Without `brain_call`, `MVG_BRAIN` defaults to `http`. A plugin that fails to imp
 ```
 POST $MVG_BRAIN_URL
 Content-Type: application/json
+Accept: text/event-stream, application/json  (only when MVG_HTTP_STREAM=1)
 Authorization: Bearer <MVG_BRAIN_TOKEN>      (only if set)
 
 {"prompt": "[VOICE via node <node> · ...] <text>...",
  "session_id": "<session>",
  "node_id": "<node>",
- "target": "<brain target for the node>"}
+ "target": "<brain target for the node>",
+ "image_b64": "<base64 JPEG frame>",        (when vision enabled and present)
+ "burst_images_b64": ["<frame1>", ...],      (when vision enabled and present)
+ "audio_b64": "<base64 WAV audio>"}          (when MVG_BRAIN_DIRECT_AUDIO=1 and present)
 ```
 
-The response must be JSON with a `"reply"` string:
+### Standard JSON Mode (`MVG_HTTP_STREAM=0`, default)
+When `MVG_HTTP_STREAM=0` (or unset), `http_brain_call` strictly expects a standard JSON response with a `"reply"` string:
 
-```
+```json
 {"reply": "<the answer, spoken as-is>"}
 ```
 
-The `http` brain has no partials: the streaming hook fires once with the full reply. A missing `MVG_BRAIN_URL` raises `MVG_BRAIN_URL not set`.
+In standard JSON mode, `http_brain_call` only accepts `application/json` and rejects or ignores streaming SSE responses. The streaming hook fires once with the full reply. A missing `MVG_BRAIN_URL` raises `MVG_BRAIN_URL not set`.
+
+### Streaming SSE Mode (`MVG_HTTP_STREAM=1`)
+When `MVG_HTTP_STREAM=1`, the gateway requests `Accept: text/event-stream, application/json` and incrementally consumes Server-Sent Events (SSE) lines from `MVG_BRAIN_URL`:
+- `event: sentence` with `{"text": "..."}` or `{"reply": "..."}`
+- `event: delta` with `{"text": "..."}` or `{"delta": "..."}` or `{"reply": "..."}`
+- `event: reply` with `{"reply": "..."}` or `{"text": "..."}`
+- OpenAI-compatible `data: {"choices": [{"delta": {"content": "..."}}]}` chunks (terminated by `data: [DONE]`)
+
+Partial text is streamed to caller listeners and sentence segmenters as each chunk arrives. If the brain answers with `application/json`, the gateway falls back gracefully to single-reply parsing.
+
+Streams are bounded by two safety gates:
+- `MAX_SSE_CHARS` (default `256 * 1024` chars, override with `MVG_MAX_SSE_CHARS`): halts accumulation if total text exceeds this cap to avoid memory bloat.
+- Wall-clock deadline (`max_stream_seconds`, defaulting to `MVG_HIVE_TIMEOUT`): halts consumption if the connection remains open past the timeout.
+
+### Direct-Audio Mode (`MVG_BRAIN_DIRECT_AUDIO=1`)
+When `MVG_BRAIN_DIRECT_AUDIO=1`, voice audio captured on a turn is base64-encoded and passed directly to the brain via the `"audio_b64"` field in the request payload.
 
 ## Backends
 
@@ -137,6 +158,9 @@ Every variable below is also listed, commented, in `.env.example`. Secrets have 
 | `MVG_BRAIN` | `plugin` when the plugin has `brain_call`, else `http` — `plugin` or `http` |
 | `MVG_BRAIN_URL` | unset (required for `http`) — endpoint the `http` brain POSTs to |
 | `MVG_BRAIN_TOKEN` | unset — if set, sent as `Authorization: Bearer <token>` |
+| `MVG_HTTP_STREAM` | `0` — `1` enables streaming SSE mode for the `http` brain, requesting `Accept: text/event-stream` and incrementally consuming sentence/delta SSE lines |
+| `MVG_BRAIN_DIRECT_AUDIO` | `0` — `1` forwards raw audio (`audio_b64`) in the brain payload JSON when captured on the turn |
+| `MVG_MAX_SSE_CHARS` | `262144` (256 KiB) — maximum accumulated characters from an SSE brain stream |
 | `MVG_DEFAULT_TARGET` | `agent` — brain target for a node with no profile (`MVG_HIVE_TARGET` is read as a fallback) |
 | `MVG_HIVE_TIMEOUT` | `45` — seconds a brain call may take |
 | `MVG_AGENT_NAME` | `the assistant` — the agent's name in prompts and the spoken apology |

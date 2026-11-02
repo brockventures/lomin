@@ -198,6 +198,8 @@ from audio_utils import (  # noqa: E402,F401
 )
 from vision_adpcm import (  # noqa: E402,F401
     ADPCM_MAGIC,
+    MAX_IMAGE_B64_BYTES,
+    MAX_IMAGE_BYTES,
     decode_adpcm_to_wav,
     extract_vision_payloads,
 )
@@ -336,6 +338,70 @@ def is_adpcm_enabled() -> bool:
 # Streaming SSE HTTP brain & direct-audio flags (Chunk 2 parity)
 HTTP_BRAIN_STREAM = os.environ.get("MVG_HTTP_STREAM", "0") == "1"
 BRAIN_DIRECT_AUDIO = os.environ.get("MVG_BRAIN_DIRECT_AUDIO", "0") == "1"
+MAX_SSE_CHARS = int(os.environ.get("MVG_MAX_SSE_CHARS", str(256 * 1024)))
+MAX_AUDIO_B64_BYTES = int(os.environ.get("MVG_MAX_AUDIO_B64_BYTES", str(10 * 1024 * 1024)))
+MAX_AUDIO_BYTES = int(os.environ.get("MVG_MAX_AUDIO_BYTES", str(10 * 1024 * 1024)))
+
+
+def is_http_stream_enabled() -> bool:
+    return bool(HTTP_BRAIN_STREAM) or (os.environ.get("MVG_HTTP_STREAM", "0") == "1")
+
+
+def validate_multimodal_payload(req: dict) -> tuple[int | None, str | None]:
+    """Validate type, base64 validity, and max size of multimodal fields.
+
+    Checks image_b64, burst_images_b64, and audio_b64 if present in req.
+    Returns (status_code, error_message) on failure, or (None, None) if valid.
+    """
+    if not isinstance(req, dict):
+        return 400, "request body must be a JSON object"
+
+    # 1. image_b64
+    if "image_b64" in req and req["image_b64"] is not None:
+        val = req["image_b64"]
+        if not isinstance(val, str):
+            return 400, "image_b64 must be a string"
+        if len(val) > MAX_IMAGE_B64_BYTES:
+            return 413, f"image_b64 payload exceeds maximum allowed size ({MAX_IMAGE_B64_BYTES} bytes)"
+        try:
+            decoded = base64.b64decode(val, validate=True)
+        except Exception:
+            return 400, "image_b64 is not valid base64"
+        if len(decoded) > MAX_IMAGE_BYTES:
+            return 413, f"image_b64 decoded data exceeds maximum allowed size ({MAX_IMAGE_BYTES} bytes)"
+
+    # 2. burst_images_b64
+    if "burst_images_b64" in req and req["burst_images_b64"] is not None:
+        val = req["burst_images_b64"]
+        if not isinstance(val, list):
+            return 400, "burst_images_b64 must be a list"
+        for idx, item in enumerate(val):
+            if not isinstance(item, str):
+                return 400, f"burst_images_b64[{idx}] must be a string"
+            if len(item) > MAX_IMAGE_B64_BYTES:
+                return 413, f"burst_images_b64[{idx}] payload exceeds maximum allowed size ({MAX_IMAGE_B64_BYTES} bytes)"
+            try:
+                decoded = base64.b64decode(item, validate=True)
+            except Exception:
+                return 400, f"burst_images_b64[{idx}] is not valid base64"
+            if len(decoded) > MAX_IMAGE_BYTES:
+                return 413, f"burst_images_b64[{idx}] decoded data exceeds maximum allowed size ({MAX_IMAGE_BYTES} bytes)"
+
+    # 3. audio_b64
+    if "audio_b64" in req and req["audio_b64"] is not None:
+        val = req["audio_b64"]
+        if not isinstance(val, str):
+            return 400, "audio_b64 must be a string"
+        if len(val) > MAX_AUDIO_B64_BYTES:
+            return 413, f"audio_b64 payload exceeds maximum allowed size ({MAX_AUDIO_B64_BYTES} bytes)"
+        try:
+            decoded = base64.b64decode(val, validate=True)
+        except Exception:
+            return 400, "audio_b64 is not valid base64"
+        if len(decoded) > MAX_AUDIO_BYTES:
+            return 413, f"audio_b64 decoded data exceeds maximum allowed size ({MAX_AUDIO_BYTES} bytes)"
+
+    return None, None
 
 # Home Assistant conversation intent fast-path flags (Chunk 3 parity)
 HA_ENABLED = os.environ.get("MVG_HA_ENABLED", "0") == "1"
@@ -1762,20 +1828,26 @@ MVG_BRAIN_URL = os.environ.get("MVG_BRAIN_URL", "")
 MVG_BRAIN_TOKEN = os.environ.get("MVG_BRAIN_TOKEN", "")
 
 
-def consume_brain_sse_lines(lines, on_partial=None) -> str:
+def consume_brain_sse_lines(lines, on_partial=None, max_stream_seconds: float | None = None) -> str:
     """Consume Server-Sent Events (SSE) lines from an HTTP brain stream.
 
     Supports SSE `event: sentence`, `event: delta`, and `event: reply`
     (with JSON {"text": ...} or {"reply": ...}) as well as OpenAI-style
     `data: {"choices": [{"delta": {"content": ...}}]}` lines.
     Calls `on_partial(accumulated_text)` as each text chunk arrives.
+    Enforces MAX_SSE_CHARS char ceiling and max_stream_seconds total deadline.
     Returns the final reply string.
     """
     current_event = ""
-    accumulated = ""
+    chunks: list[str] = []
+    current_len = 0
     final_reply = ""
+    start_time = time.monotonic()
 
     for raw_line in lines:
+        if max_stream_seconds is not None and (time.monotonic() - start_time) > max_stream_seconds:
+            break
+
         if isinstance(raw_line, (bytes, bytearray)):
             line = raw_line.decode("utf-8", errors="replace")
         else:
@@ -1813,9 +1885,18 @@ def consume_brain_sse_lines(lines, on_partial=None) -> str:
                         if isinstance(delta, dict):
                             content = delta.get("content")
                             if isinstance(content, str) and content:
-                                accumulated += content
+                                if current_len + len(content) > MAX_SSE_CHARS:
+                                    allowed = max(0, MAX_SSE_CHARS - current_len)
+                                    if allowed > 0:
+                                        chunks.append(content[:allowed])
+                                        current_len += allowed
+                                        if on_partial:
+                                            on_partial("".join(chunks))
+                                    break
+                                chunks.append(content)
+                                current_len += len(content)
                                 if on_partial:
-                                    on_partial(accumulated)
+                                    on_partial("".join(chunks))
                                 continue
 
             chunk = ""
@@ -1843,41 +1924,71 @@ def consume_brain_sse_lines(lines, on_partial=None) -> str:
                 continue
 
             if current_event == "reply":
-                accumulated = chunk
                 final_reply = chunk
+                if len(chunk) > MAX_SSE_CHARS:
+                    chunk = chunk[:MAX_SSE_CHARS]
+                chunks = [chunk]
+                current_len = len(chunk)
                 if on_partial:
-                    on_partial(accumulated)
+                    on_partial(chunk)
             elif current_event == "sentence":
-                if accumulated and not accumulated.endswith((" ", "\n")) and not chunk.startswith(" "):
-                    accumulated += " " + chunk
-                else:
-                    accumulated += chunk
+                sep = ""
+                if chunks and not chunks[-1].endswith((" ", "\n")) and not chunk.startswith(" "):
+                    sep = " "
+                to_add = sep + chunk if sep else chunk
+                if current_len + len(to_add) > MAX_SSE_CHARS:
+                    allowed = max(0, MAX_SSE_CHARS - current_len)
+                    if allowed > 0:
+                        chunks.append(to_add[:allowed])
+                        current_len += allowed
+                        if on_partial:
+                            on_partial("".join(chunks))
+                    break
+                chunks.append(to_add)
+                current_len += len(to_add)
                 if on_partial:
-                    on_partial(accumulated)
+                    on_partial("".join(chunks))
             elif current_event == "delta":
-                accumulated += chunk
+                to_add = chunk
+                if current_len + len(to_add) > MAX_SSE_CHARS:
+                    allowed = max(0, MAX_SSE_CHARS - current_len)
+                    if allowed > 0:
+                        chunks.append(to_add[:allowed])
+                        current_len += allowed
+                        if on_partial:
+                            on_partial("".join(chunks))
+                    break
+                chunks.append(to_add)
+                current_len += len(to_add)
                 if on_partial:
-                    on_partial(accumulated)
+                    on_partial("".join(chunks))
             else:
-                if final_reply and accumulated == chunk:
+                if final_reply and "".join(chunks) == chunk:
                     if on_partial:
-                        on_partial(accumulated)
+                        on_partial("".join(chunks))
                 else:
-                    accumulated += chunk
+                    to_add = chunk
+                    if current_len + len(to_add) > MAX_SSE_CHARS:
+                        allowed = max(0, MAX_SSE_CHARS - current_len)
+                        if allowed > 0:
+                            chunks.append(to_add[:allowed])
+                            current_len += allowed
+                            if on_partial:
+                                on_partial("".join(chunks))
+                        break
+                    chunks.append(to_add)
+                    current_len += len(to_add)
                     if on_partial:
-                        on_partial(accumulated)
+                        on_partial("".join(chunks))
 
-    return final_reply if final_reply else accumulated
+    return final_reply if final_reply else "".join(chunks)
 
 
-def http_brain_call(prompt: str, session_id: str, node_id: str, speaker: str,
-                    speaker_score, timeout: int,
-                    image_b64: str | None = None, burst_images_b64: list[str] | None = None,
-                    audio_b64: str | None = None) -> str:
-    """Brain over plain HTTP (standalone). POSTs the framed prompt as JSON to
-    MVG_BRAIN_URL and returns the response's "reply" string."""
-    if not MVG_BRAIN_URL:
-        raise RuntimeError("MVG_BRAIN_URL not set")
+def build_http_brain_body(prompt: str, session_id: str, node_id: str, speaker: str,
+                          speaker_score,
+                          image_b64: str | None = None, burst_images_b64: list[str] | None = None,
+                          audio_b64: str | None = None) -> tuple[dict, bytes]:
+    """Shared request body builder for http_brain_call and http_brain_call_stream."""
     body_dict = {
         "prompt": _frame_for_call(prompt, node_id, speaker, speaker_score),
         "session_id": session_id,
@@ -1899,16 +2010,35 @@ def http_brain_call(prompt: str, session_id: str, node_id: str, speaker: str,
         aud = audio_b64 or ctx.get("audio_b64")
         if aud:
             body_dict["audio_b64"] = aud
-    body = json.dumps(body_dict).encode("utf-8")
+    return body_dict, json.dumps(body_dict).encode("utf-8")
+
+
+def http_brain_call(prompt: str, session_id: str, node_id: str, speaker: str,
+                    speaker_score, timeout: int,
+                    image_b64: str | None = None, burst_images_b64: list[str] | None = None,
+                    audio_b64: str | None = None) -> str:
+    """Brain over plain HTTP (standalone). POSTs the framed prompt as JSON to
+    MVG_BRAIN_URL and returns the response's "reply" string.
+
+    When MVG_HTTP_STREAM is enabled, also accepts and consumes text/event-stream.
+    """
+    if not MVG_BRAIN_URL:
+        raise RuntimeError("MVG_BRAIN_URL not set")
+    is_stream = is_http_stream_enabled()
+    _, body = build_http_brain_body(prompt, session_id, node_id, speaker, speaker_score,
+                                    image_b64=image_b64, burst_images_b64=burst_images_b64,
+                                    audio_b64=audio_b64)
     headers = {"Content-Type": "application/json"}
+    if is_stream:
+        headers["Accept"] = "text/event-stream, application/json"
     if MVG_BRAIN_TOKEN:
         headers["Authorization"] = f"Bearer {MVG_BRAIN_TOKEN}"
     req = Request(MVG_BRAIN_URL, data=body, headers=headers, method="POST")
     with urlopen(req, timeout=timeout) as resp:
         headers_obj = getattr(resp, "headers", None)
         content_type = headers_obj.get("Content-Type", "") if hasattr(headers_obj, "get") else ""
-        if "text/event-stream" in content_type:
-            return consume_brain_sse_lines(resp, on_partial=None)
+        if is_stream and "text/event-stream" in content_type:
+            return consume_brain_sse_lines(resp, on_partial=None, max_stream_seconds=timeout)
         data = json.loads(resp.read().decode("utf-8"))
     reply = data.get("reply")
     if not isinstance(reply, str):
@@ -1926,30 +2056,10 @@ def http_brain_call_stream(prompt: str, session_id: str, node_id: str, speaker: 
     if not MVG_BRAIN_URL:
         raise RuntimeError("MVG_BRAIN_URL not set")
 
-    is_stream = bool(HTTP_BRAIN_STREAM) or (os.environ.get("MVG_HTTP_STREAM", "0") == "1")
-    body_dict = {
-        "prompt": _frame_for_call(prompt, node_id, speaker, speaker_score),
-        "session_id": session_id,
-        "node_id": node_id,
-        "target": _call_target(node_id),
-    }
-    enable_vision = is_vision_enabled()
-    if enable_vision:
-        ctx = getattr(_FRAME_CTX, "ctx", None) or {}
-        img = image_b64 or ctx.get("image_b64")
-        burst = burst_images_b64 or ctx.get("burst_images_b64")
-        if img:
-            body_dict["image_b64"] = img
-        if burst:
-            body_dict["burst_images_b64"] = burst
-    brain_direct_audio = bool(BRAIN_DIRECT_AUDIO) or (os.environ.get("MVG_BRAIN_DIRECT_AUDIO", "0") == "1")
-    if brain_direct_audio:
-        ctx = getattr(_FRAME_CTX, "ctx", None) or {}
-        aud = audio_b64 or ctx.get("audio_b64")
-        if aud:
-            body_dict["audio_b64"] = aud
-
-    body = json.dumps(body_dict).encode("utf-8")
+    is_stream = is_http_stream_enabled()
+    _, body = build_http_brain_body(prompt, session_id, node_id, speaker, speaker_score,
+                                    image_b64=image_b64, burst_images_b64=burst_images_b64,
+                                    audio_b64=audio_b64)
     headers = {"Content-Type": "application/json"}
     if is_stream:
         headers["Accept"] = "text/event-stream, application/json"
@@ -1961,7 +2071,7 @@ def http_brain_call_stream(prompt: str, session_id: str, node_id: str, speaker: 
         headers_obj = getattr(resp, "headers", None)
         content_type = headers_obj.get("Content-Type", "") if hasattr(headers_obj, "get") else ""
         if "text/event-stream" in content_type or (is_stream and "application/json" not in content_type):
-            reply = consume_brain_sse_lines(resp, on_partial=on_partial)
+            reply = consume_brain_sse_lines(resp, on_partial=on_partial, max_stream_seconds=timeout)
         else:
             data = json.loads(resp.read().decode("utf-8"))
             reply = data.get("reply")
@@ -2732,8 +2842,17 @@ class GatewayHandler(BaseHTTPRequestHandler):
         body = self._read_body()
         try:
             req = json.loads(body.decode("utf-8")) if body else {}
+            if not isinstance(req, dict):
+                self._send_json(400, {"error": "request body must be a JSON object"})
+                return
         except Exception:
-            req = {}
+            self._send_json(400, {"error": "invalid JSON body"})
+            return
+
+        err_code, err_msg = validate_multimodal_payload(req)
+        if err_code is not None:
+            self._send_json(err_code, {"error": err_msg})
+            return
 
         prompt = req.get("prompt") or ""
         session_id = req.get("session_id") or ""
@@ -2872,8 +2991,17 @@ class GatewayHandler(BaseHTTPRequestHandler):
         body = self._read_body()
         try:
             req = json.loads(body.decode("utf-8")) if body else {}
+            if not isinstance(req, dict):
+                self._send_json(400, {"error": "request body must be a JSON object"})
+                return
         except Exception:
-            req = {}
+            self._send_json(400, {"error": "invalid JSON body"})
+            return
+
+        err_code, err_msg = validate_multimodal_payload(req)
+        if err_code is not None:
+            self._send_json(err_code, {"error": err_msg})
+            return
 
         prompt = req.get("prompt") or ""
         session_id = req.get("session_id") or ""

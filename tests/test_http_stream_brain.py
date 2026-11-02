@@ -1,10 +1,12 @@
 import base64
 import json
-import os
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import pytest
 
@@ -315,3 +317,190 @@ def test_brain_direct_audio_gating(monkeypatch):
         gateway._FRAME_CTX.ctx = None
     finally:
         server.stop()
+
+
+# ---------------------------------------------------------------------------
+# Tests for Bounded SSE Stream, Validation & Shared Request Builder
+# ---------------------------------------------------------------------------
+
+def test_consume_brain_sse_max_sse_chars(monkeypatch):
+    monkeypatch.setattr(gateway, "MAX_SSE_CHARS", 50)
+    lines = [
+        'data: {"choices": [{"delta": {"content": "' + ("A" * 30) + '"}}]}\n',
+        'data: {"choices": [{"delta": {"content": "' + ("B" * 30) + '"}}]}\n',
+        'data: {"choices": [{"delta": {"content": "' + ("C" * 30) + '"}}]}\n',
+    ]
+    partials = []
+    reply = gateway.consume_brain_sse_lines(lines, on_partial=partials.append)
+    assert len(reply) == 50
+    assert reply == ("A" * 30) + ("B" * 20)
+    assert len(partials) == 2
+
+
+def test_consume_brain_sse_max_stream_seconds():
+    def slow_generator():
+        yield 'data: {"choices": [{"delta": {"content": "First"}}]}\n'
+        time.sleep(0.2)
+        yield 'data: {"choices": [{"delta": {"content": "Second"}}]}\n'
+
+    partials = []
+    reply = gateway.consume_brain_sse_lines(slow_generator(), on_partial=partials.append, max_stream_seconds=0.1)
+    assert reply == "First"
+    assert partials == ["First"]
+
+
+def test_validate_multimodal_payload_unit(monkeypatch):
+    assert gateway.validate_multimodal_payload("not a dict") == (400, "request body must be a JSON object")
+
+    # Valid empty or normal dict
+    assert gateway.validate_multimodal_payload({}) == (None, None)
+    valid_b64 = base64.b64encode(b"validdata").decode("ascii")
+    assert gateway.validate_multimodal_payload({
+        "image_b64": valid_b64,
+        "burst_images_b64": [valid_b64],
+        "audio_b64": valid_b64,
+    }) == (None, None)
+
+    # image_b64 checks
+    assert gateway.validate_multimodal_payload({"image_b64": 12345})[0] == 400
+    assert gateway.validate_multimodal_payload({"image_b64": "invalid-b64!@#$%"})[0] == 400
+    monkeypatch.setattr(gateway, "MAX_IMAGE_B64_BYTES", 20)
+    assert gateway.validate_multimodal_payload({"image_b64": valid_b64 * 5})[0] == 413
+    monkeypatch.undo()
+
+    # burst_images_b64 checks
+    assert gateway.validate_multimodal_payload({"burst_images_b64": "not a list"})[0] == 400
+    assert gateway.validate_multimodal_payload({"burst_images_b64": [123]})[0] == 400
+    assert gateway.validate_multimodal_payload({"burst_images_b64": ["bad_b64@@"]})[0] == 400
+    monkeypatch.setattr(gateway, "MAX_IMAGE_B64_BYTES", 20)
+    assert gateway.validate_multimodal_payload({"burst_images_b64": [valid_b64 * 5]})[0] == 413
+    monkeypatch.undo()
+
+    # audio_b64 checks
+    assert gateway.validate_multimodal_payload({"audio_b64": ["not a str"]})[0] == 400
+    assert gateway.validate_multimodal_payload({"audio_b64": "bad_b64$$$"})[0] == 400
+    monkeypatch.setattr(gateway, "MAX_AUDIO_B64_BYTES", 20)
+    assert gateway.validate_multimodal_payload({"audio_b64": valid_b64 * 5})[0] == 413
+    monkeypatch.undo()
+
+
+def test_build_http_brain_body_shared_helper(monkeypatch):
+    monkeypatch.setattr(gateway, "ENABLE_VISION", False)
+    monkeypatch.setattr(gateway, "BRAIN_DIRECT_AUDIO", False)
+    monkeypatch.delenv("MVG_ENABLE_VISION", raising=False)
+    monkeypatch.delenv("MVG_BRAIN_DIRECT_AUDIO", raising=False)
+
+    body_dict, body_bytes = gateway.build_http_brain_body(
+        "hello", "sess-1", "node-1", "speaker1", 0.9,
+        image_b64="img", burst_images_b64=["burst"], audio_b64="aud"
+    )
+    assert "prompt" in body_dict
+    assert "session_id" in body_dict
+    assert "image_b64" not in body_dict
+    assert "burst_images_b64" not in body_dict
+    assert "audio_b64" not in body_dict
+    assert json.loads(body_bytes.decode("utf-8")) == body_dict
+
+    # With vision enabled
+    monkeypatch.setattr(gateway, "ENABLE_VISION", True)
+    body_dict, _ = gateway.build_http_brain_body(
+        "hello", "sess-1", "node-1", "speaker1", 0.9,
+        image_b64="img", burst_images_b64=["burst"], audio_b64="aud"
+    )
+    assert body_dict["image_b64"] == "img"
+    assert body_dict["burst_images_b64"] == ["burst"]
+    assert "audio_b64" not in body_dict
+
+    # With direct audio enabled
+    monkeypatch.setattr(gateway, "BRAIN_DIRECT_AUDIO", True)
+    body_dict, _ = gateway.build_http_brain_body(
+        "hello", "sess-1", "node-1", "speaker1", 0.9,
+        image_b64="img", burst_images_b64=["burst"], audio_b64="aud"
+    )
+    assert body_dict["audio_b64"] == "aud"
+
+
+def test_http_brain_call_sse_gated_by_mvg_http_stream(monkeypatch):
+    sent_headers = []
+
+    class SSEHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            sent_headers.append(dict(self.headers))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(b"event: reply\ndata: {\"reply\": \"streamed reply\"}\n\n")
+
+        def log_message(self, *args):
+            pass
+
+    server = MockBrainServer(SSEHandler)
+    server.start()
+    try:
+        monkeypatch.setattr(gateway, "MVG_BRAIN_URL", f"http://127.0.0.1:{server.port}/brain")
+
+        # 1. MVG_HTTP_STREAM = 0 / False -> does NOT accept or consume SSE
+        monkeypatch.setattr(gateway, "HTTP_BRAIN_STREAM", False)
+        monkeypatch.setenv("MVG_HTTP_STREAM", "0")
+        with pytest.raises(Exception):
+            gateway.http_brain_call("test", "sess-1", "node-1", "", None, 5)
+        assert "text/event-stream" not in sent_headers[0].get("Accept", "")
+
+        # 2. MVG_HTTP_STREAM = 1 / True -> accepts and consumes SSE
+        monkeypatch.setattr(gateway, "HTTP_BRAIN_STREAM", True)
+        monkeypatch.setenv("MVG_HTTP_STREAM", "1")
+        reply = gateway.http_brain_call("test", "sess-2", "node-1", "", None, 5)
+        assert reply == "streamed reply"
+        assert "text/event-stream" in sent_headers[1].get("Accept", "")
+    finally:
+        server.stop()
+
+
+def test_gateway_ask_endpoints_multimodal_validation(monkeypatch):
+    server = HTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    port = server.server_port
+    base_url = f"http://127.0.0.1:{port}"
+
+    try:
+        # 1. Invalid JSON body to /ask
+        req = Request(f"{base_url}/ask", data=b"not json", headers={"Content-Type": "application/json"}, method="POST")
+        with pytest.raises(HTTPError) as exc_info:
+            urlopen(req, timeout=5)
+        assert exc_info.value.code == 400
+
+        # 2. Invalid image_b64 (not valid base64) to /ask
+        body = json.dumps({"prompt": "hi", "image_b64": "invalid!@#$"}).encode("utf-8")
+        req = Request(f"{base_url}/ask", data=body, headers={"Content-Type": "application/json"}, method="POST")
+        with pytest.raises(HTTPError) as exc_info:
+            urlopen(req, timeout=5)
+        assert exc_info.value.code == 400
+
+        # 3. Oversize image_b64 to /ask -> 413
+        monkeypatch.setattr(gateway, "MAX_IMAGE_B64_BYTES", 10)
+        body = json.dumps({"prompt": "hi", "image_b64": "AAAA" * 5}).encode("utf-8")
+        req = Request(f"{base_url}/ask", data=body, headers={"Content-Type": "application/json"}, method="POST")
+        with pytest.raises(HTTPError) as exc_info:
+            urlopen(req, timeout=5)
+        assert exc_info.value.code == 413
+        monkeypatch.undo()
+
+        # 4. Invalid burst_images_b64 (element not base64) to /ask/stream -> 400
+        body = json.dumps({"prompt": "hi", "burst_images_b64": ["bad!@#$"]}).encode("utf-8")
+        req = Request(f"{base_url}/ask/stream", data=body, headers={"Content-Type": "application/json"}, method="POST")
+        with pytest.raises(HTTPError) as exc_info:
+            urlopen(req, timeout=5)
+        assert exc_info.value.code == 400
+
+        # 5. Oversize audio_b64 to /ask/stream -> 413
+        monkeypatch.setattr(gateway, "MAX_AUDIO_B64_BYTES", 10)
+        body = json.dumps({"prompt": "hi", "audio_b64": "AAAA" * 5}).encode("utf-8")
+        req = Request(f"{base_url}/ask/stream", data=body, headers={"Content-Type": "application/json"}, method="POST")
+        with pytest.raises(HTTPError) as exc_info:
+            urlopen(req, timeout=5)
+        assert exc_info.value.code == 413
+        monkeypatch.undo()
+    finally:
+        server.shutdown()
+        server.server_close()
