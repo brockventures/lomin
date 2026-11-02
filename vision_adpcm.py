@@ -353,7 +353,7 @@ def extract_vision_payloads(parts_or_json: dict) -> Tuple[Optional[bytes], list[
     burst_images is a list of bytes (up to 5 frames).
 
     Validates base64 strings and enforces MAX_IMAGE_B64_BYTES / MAX_IMAGE_BYTES.
-    Non-base64 text and invalid types are strictly rejected (return None / skipped).
+    Non-base64 text, invalid types, and invalid image formats raise ValueError('invalid image payload').
     """
     if not isinstance(parts_or_json, dict):
         return None, []
@@ -364,68 +364,88 @@ def extract_vision_payloads(parts_or_json: dict) -> Tuple[Optional[bytes], list[
         if isinstance(val, (bytes, bytearray)):
             b = bytes(val)
             if not b:
-                return None
+                raise ValueError("invalid image payload")
             if is_b64_hint:
                 if len(b) > MAX_IMAGE_B64_BYTES:
-                    return None
+                    raise ValueError("invalid image payload")
                 try:
                     decoded = base64.b64decode(b, validate=True)
-                    if decoded and len(decoded) <= MAX_IMAGE_BYTES and is_valid_image_bytes(decoded):
-                        return decoded
                 except Exception:
-                    return None
-                return None
-            if len(b) > MAX_IMAGE_BYTES or not is_valid_image_bytes(b):
-                return None
-            return b
-        if isinstance(val, str):
-            s = val.strip()
-            if not s or len(s) > MAX_IMAGE_B64_BYTES:
-                return None
+                    raise ValueError("invalid image payload")
+                if not decoded or len(decoded) > MAX_IMAGE_BYTES or not is_valid_image_bytes(decoded):
+                    raise ValueError("invalid image payload")
+                return decoded
+            if len(b) > MAX_IMAGE_BYTES:
+                raise ValueError("invalid image payload")
+            if is_valid_image_bytes(b):
+                return b
             try:
-                decoded = base64.b64decode(s, validate=True)
+                decoded = base64.b64decode(b, validate=True)
                 if decoded and len(decoded) <= MAX_IMAGE_BYTES and is_valid_image_bytes(decoded):
                     return decoded
             except Exception:
-                return None
-            return None
-        return None
+                pass
+            raise ValueError("invalid image payload")
+        if isinstance(val, str):
+            s = val.strip()
+            if not s:
+                raise ValueError("invalid image payload")
+            if len(s) > MAX_IMAGE_B64_BYTES:
+                raise ValueError("invalid image payload")
+            try:
+                decoded = base64.b64decode(s, validate=True)
+            except Exception:
+                raise ValueError("invalid image payload")
+            if not decoded or len(decoded) > MAX_IMAGE_BYTES or not is_valid_image_bytes(decoded):
+                raise ValueError("invalid image payload")
+            return decoded
+        raise ValueError("invalid image payload")
 
-    # Single image extraction: check 'image', then 'image_b64'
+    # Single image extraction: check 'image', then 'image_b64', then 'image_bytes'
     image_bytes: Optional[bytes] = None
-    if "image" in parts_or_json and parts_or_json["image"]:
+    if "image" in parts_or_json and parts_or_json["image"] is not None:
         image_bytes = _to_bytes(parts_or_json["image"])
-    elif "image_b64" in parts_or_json and parts_or_json["image_b64"]:
-        image_bytes = _to_bytes(parts_or_json["image_b64"], is_b64_hint=True)
+    elif "image_bytes" in parts_or_json and parts_or_json["image_bytes"] is not None:
+        image_bytes = _to_bytes(parts_or_json["image_bytes"])
+    if "image_b64" in parts_or_json and parts_or_json["image_b64"] is not None:
+        b64_img = _to_bytes(parts_or_json["image_b64"], is_b64_hint=True)
+        if image_bytes is None:
+            image_bytes = b64_img
 
     # Burst images extraction
     burst_images: list[bytes] = []
     # 1. Discrete numbered parts image_0 .. image_4
     for i in range(5):
         k = f"image_{i}"
-        if k in parts_or_json and parts_or_json[k]:
+        if k in parts_or_json and parts_or_json[k] is not None:
             b = _to_bytes(parts_or_json[k])
             if b:
                 burst_images.append(b)
 
     # 2. burst_images_b64 list
-    if not burst_images and "burst_images_b64" in parts_or_json:
+    if "burst_images_b64" in parts_or_json and parts_or_json["burst_images_b64"] is not None:
         raw_list = parts_or_json["burst_images_b64"]
-        if isinstance(raw_list, list):
-            for item in raw_list[:5]:
-                if isinstance(item, (str, bytes, bytearray)):
-                    b = _to_bytes(item, is_b64_hint=True)
-                    if b:
-                        burst_images.append(b)
+        if not isinstance(raw_list, (list, tuple)):
+            raise ValueError("invalid image payload")
+        b64_burst = []
+        for item in raw_list:
+            b = _to_bytes(item, is_b64_hint=True)
+            if b and len(b64_burst) < 5:
+                b64_burst.append(b)
+        if not burst_images:
+            burst_images = b64_burst
 
     # 3. burst_images list
-    if not burst_images and "burst_images" in parts_or_json:
+    if "burst_images" in parts_or_json and parts_or_json["burst_images"] is not None:
         raw_list = parts_or_json["burst_images"]
-        if isinstance(raw_list, list):
-            for item in raw_list[:5]:
-                if isinstance(item, (str, bytes, bytearray)):
-                    b = _to_bytes(item)
-                    if b:
-                        burst_images.append(b)
+        if not isinstance(raw_list, (list, tuple)):
+            raise ValueError("invalid image payload")
+        raw_burst = []
+        for item in raw_list:
+            b = _to_bytes(item)
+            if b and len(raw_burst) < 5:
+                raw_burst.append(b)
+        if not burst_images:
+            burst_images = raw_burst
 
     return image_bytes, burst_images

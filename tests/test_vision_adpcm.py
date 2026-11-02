@@ -250,31 +250,100 @@ def test_decode_adpcm_size_cap():
 
 
 def test_extract_vision_payloads_validation():
-    # Non-base64 text strings must be rejected
-    img, burst = extract_vision_payloads({"image": "not-valid-base64-text!"})
-    assert img is None
-    assert burst == []
+    # Non-base64 text strings must raise ValueError
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"image": "not-valid-base64-text!"})
 
-    img, burst = extract_vision_payloads({"image_b64": "invalid base64 ???"})
-    assert img is None
-    assert burst == []
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"image_b64": "invalid base64 ???"})
 
-    # Oversized base64 string must be rejected
+    # Oversized base64 string must raise ValueError
     oversized_str = "A" * (MAX_IMAGE_B64_BYTES + 10)
-    img, burst = extract_vision_payloads({"image_b64": oversized_str})
-    assert img is None
-    assert burst == []
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"image_b64": oversized_str})
 
-    # burst_images_b64 must be a list
-    img, burst = extract_vision_payloads({"burst_images_b64": "not-a-list"})
-    assert img is None
-    assert burst == []
+    # burst_images_b64 must be a list, non-list raises ValueError
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"burst_images_b64": "not-a-list"})
 
-    # burst_images_b64 filters out non-string and non-base64 items
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"burst_images": "not-a-list"})
+
+    # burst_images_b64 with invalid base64 or invalid types raises ValueError
     valid_b64 = base64.b64encode(b"\xff\xd8\xff" + b"frame1").decode("ascii")
-    img, burst = extract_vision_payloads({"burst_images_b64": [valid_b64, "invalid_b64!", 12345]})
-    assert img is None
-    assert burst == [b"\xff\xd8\xff" + b"frame1"]
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"burst_images_b64": [valid_b64, "invalid_b64!"]})
+
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"burst_images_b64": [valid_b64, 12345]})
+
+    # Invalid magic bytes on raw bytes inputs must raise ValueError
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"image": b"corrupted_raw_bytes"})
+
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"image_0": b"bad_magic_bytes"})
+
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"burst_images": [b"bad_magic_bytes"]})
+
+    # Invalid magic bytes on base64 inputs must raise ValueError
+    bad_magic_b64 = base64.b64encode(b"not_an_image").decode("ascii")
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"image_b64": bad_magic_b64})
+
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"image": bad_magic_b64})
+
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"burst_images_b64": [bad_magic_b64]})
+
+
+def test_voice_turn_invalid_image_returns_400(server, monkeypatch):
+    monkeypatch.setenv("MVG_ENABLE_VISION", "1")
+    monkeypatch.setattr(gateway, "ENABLE_VISION", True)
+
+    # 1. Invalid raw bytes in image
+    parts = {
+        "node_id": "test_node",
+        "audio": ("audio.wav", WAV_16K),
+        "image": ("bad.jpg", b"corrupted-non-image-data"),
+        "tts": "none",
+    }
+    status, data = post_turn(server, parts)
+    assert status == 400
+    assert b"invalid image format" in data
+
+    # 2. Invalid base64 in image_b64
+    parts = {
+        "node_id": "test_node",
+        "audio": ("audio.wav", WAV_16K),
+        "image_b64": "invalid-base64-payload!",
+        "tts": "none",
+    }
+    status, data = post_turn(server, parts)
+    assert status == 400
+
+    # 3. Invalid magic bytes in base64 in image_b64
+    bad_magic_b64 = base64.b64encode(b"corrupted-non-image").decode("ascii")
+    parts = {
+        "node_id": "test_node",
+        "audio": ("audio.wav", WAV_16K),
+        "image_b64": bad_magic_b64,
+        "tts": "none",
+    }
+    status, data = post_turn(server, parts)
+    assert status == 400
+
+    # 4. Invalid raw bytes in image_0
+    parts = {
+        "node_id": "test_node",
+        "audio": ("audio.wav", WAV_16K),
+        "image_0": ("bad_frame.jpg", b"bad-frame"),
+        "tts": "none",
+    }
+    status, data = post_turn(server, parts)
+    assert status == 400
 
 
 # ============================================================================

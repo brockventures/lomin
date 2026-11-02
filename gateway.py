@@ -203,6 +203,7 @@ from vision_adpcm import (  # noqa: E402,F401
     MAX_IMAGE_BYTES,
     decode_adpcm_to_wav,
     extract_vision_payloads,
+    is_valid_image_bytes,
 )
 from ha_fastpath import try_ha_conversation  # noqa: E402,F401
 from side_channel import (  # noqa: E402,F401
@@ -397,19 +398,6 @@ def is_http_stream_enabled() -> bool:
     return bool(HTTP_BRAIN_STREAM) or (os.environ.get("MVG_HTTP_STREAM", "0") == "1")
 
 
-def is_valid_image_bytes(data: bytes) -> bool:
-    """Validate image magic bytes for JPEG, PNG, or WEBP."""
-    if not isinstance(data, (bytes, bytearray)) or len(data) < 3:
-        return False
-    if data[:3] == b"\xff\xd8\xff":
-        return True
-    if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
-        return True
-    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return True
-    return False
-
-
 def validate_multimodal_payload(req: dict) -> tuple[int | None, str | None]:
     """Validate type, base64 validity, and max size of multimodal fields.
 
@@ -445,7 +433,7 @@ def validate_multimodal_payload(req: dict) -> tuple[int | None, str | None]:
     # Raw burst_images list
     if "burst_images" in req and req["burst_images"] is not None:
         val = req["burst_images"]
-        if not isinstance(val, list):
+        if not isinstance(val, (list, tuple)):
             return 400, "burst_images must be a list"
         for idx, item in enumerate(val):
             if isinstance(item, (bytes, bytearray)):
@@ -467,6 +455,30 @@ def validate_multimodal_payload(req: dict) -> tuple[int | None, str | None]:
             else:
                 return 400, f"burst_images[{idx}] must be bytes or string"
 
+    # Discrete numbered image_0 .. image_4
+    for i in range(5):
+        k = f"image_{i}"
+        if k in req and req[k] is not None:
+            item = req[k]
+            if isinstance(item, (bytes, bytearray)):
+                if len(item) > MAX_IMAGE_BYTES:
+                    return 413, f"{k} payload exceeds maximum allowed size ({MAX_IMAGE_BYTES} bytes)"
+                if not is_valid_image_bytes(item):
+                    return 400, f"{k} is not a valid image format (must be JPEG, PNG, or WEBP)"
+            elif isinstance(item, str):
+                if len(item) > MAX_IMAGE_B64_BYTES:
+                    return 413, f"{k} payload exceeds maximum allowed size ({MAX_IMAGE_B64_BYTES} bytes)"
+                try:
+                    decoded = base64.b64decode(item, validate=True)
+                except Exception:
+                    return 400, f"{k} is not valid base64"
+                if len(decoded) > MAX_IMAGE_BYTES:
+                    return 413, f"{k} decoded data exceeds maximum allowed size ({MAX_IMAGE_BYTES} bytes)"
+                if not is_valid_image_bytes(decoded):
+                    return 400, f"{k} is not a valid image format (must be JPEG, PNG, or WEBP)"
+            else:
+                return 400, f"{k} must be bytes or string"
+
     # 1. image_b64
     if "image_b64" in req and req["image_b64"] is not None:
         val = req["image_b64"]
@@ -480,11 +492,13 @@ def validate_multimodal_payload(req: dict) -> tuple[int | None, str | None]:
             return 400, "image_b64 is not valid base64"
         if len(decoded) > MAX_IMAGE_BYTES:
             return 413, f"image_b64 decoded data exceeds maximum allowed size ({MAX_IMAGE_BYTES} bytes)"
+        if not is_valid_image_bytes(decoded):
+            return 400, "image_b64 is not a valid image format (must be JPEG, PNG, or WEBP)"
 
     # 2. burst_images_b64
     if "burst_images_b64" in req and req["burst_images_b64"] is not None:
         val = req["burst_images_b64"]
-        if not isinstance(val, list):
+        if not isinstance(val, (list, tuple)):
             return 400, "burst_images_b64 must be a list"
         for idx, item in enumerate(val):
             if not isinstance(item, str):
@@ -497,6 +511,8 @@ def validate_multimodal_payload(req: dict) -> tuple[int | None, str | None]:
                 return 400, f"burst_images_b64[{idx}] is not valid base64"
             if len(decoded) > MAX_IMAGE_BYTES:
                 return 413, f"burst_images_b64[{idx}] decoded data exceeds maximum allowed size ({MAX_IMAGE_BYTES} bytes)"
+            if not is_valid_image_bytes(decoded):
+                return 400, f"burst_images_b64[{idx}] is not a valid image format (must be JPEG, PNG, or WEBP)"
 
     # 3. audio_b64
     if "audio_b64" in req and req["audio_b64"] is not None:
@@ -3729,11 +3745,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if content_type.startswith("multipart/form-data"):
             parts = parse_multipart_parts(body, content_type)
             if enable_vision:
-                image_bytes, burst_images = extract_vision_payloads(parts)
+                try:
+                    image_bytes, burst_images = extract_vision_payloads(parts)
+                except ValueError as exc:
+                    self._send_json(400, {"error": "invalid image format (must be JPEG, PNG, or WEBP)", "detail": str(exc)})
+                    log_request("/voice/turn", (time.time() - t0) * 1000, "error:invalid_image")
+                    return
             wav_bytes = parts.pop("audio", None)
             fields = {k: v.decode("utf-8", "replace").strip() for k, v in parts.items()}
             if enable_vision and not image_bytes and not burst_images:
-                image_bytes, burst_images = extract_vision_payloads(fields)
+                try:
+                    image_bytes, burst_images = extract_vision_payloads(fields)
+                except ValueError as exc:
+                    self._send_json(400, {"error": "invalid image format (must be JPEG, PNG, or WEBP)", "detail": str(exc)})
+                    log_request("/voice/turn", (time.time() - t0) * 1000, "error:invalid_image")
+                    return
         elif content_type in ("audio/wav", "application/octet-stream", ""):
             wav_bytes = body
 
@@ -3772,7 +3798,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return
 
         if enable_vision and not image_bytes and not burst_images and qs:
-            image_bytes, burst_images = extract_vision_payloads({k: v[0] for k, v in qs.items() if v})
+            try:
+                image_bytes, burst_images = extract_vision_payloads({k: v[0] for k, v in qs.items() if v})
+            except ValueError as exc:
+                self._send_json(400, {"error": "invalid image format (must be JPEG, PNG, or WEBP)", "detail": str(exc)})
+                log_request("/voice/turn", (time.time() - t0) * 1000, "error:invalid_image", node=node_id)
+                return
 
         if enable_vision:
             _bad_img = False
