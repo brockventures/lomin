@@ -13,7 +13,9 @@ Tests:
 from __future__ import annotations
 
 import json
+import logging
 import os
+import queue
 import stat
 import threading
 import time
@@ -28,7 +30,10 @@ import pytest
 import gateway
 from side_channel import (
     SafeRedirectHandler,
+    _enqueue_task,
+    _transcript_queue,
     _validate_url,
+    _webhook_queue,
     emit_turn_transcript,
     emit_turn_transcript_sync,
     flush_side_channel_queue,
@@ -221,7 +226,7 @@ class TestForwardArtifactsToWebhook:
         )
 
         assert sent is True
-        assert res_spoken == "You can read the docs for more details. I sent the link to Discord."
+        assert res_spoken == "You can read the docs for more details. Sending the link to Discord."
         mock_poster.assert_called_once()
         args, _ = mock_poster.call_args
         assert args[0] == DOC_WEBHOOK_URL
@@ -241,7 +246,7 @@ class TestForwardArtifactsToWebhook:
         )
 
         assert sent is True
-        assert res_spoken == "Here is the implementation. I sent the link to Discord."
+        assert res_spoken == "Here is the implementation. Sending the link to Discord."
         mock_poster.assert_called_once()
         assert mock_poster.call_args[0][0] == DOC_WEBHOOK_URL
 
@@ -260,7 +265,7 @@ class TestForwardArtifactsToWebhook:
         )
 
         assert sent is True
-        assert res_spoken == "See the GitHub repository. I sent the link to Discord."
+        assert res_spoken == "See the GitHub repository. Sending the link to Discord."
         assert mock_poster.call_args[0][0] == DOC_WEBHOOK_URL
 
     def test_missing_webhook_url_returns_false_and_does_not_post(self, monkeypatch):
@@ -285,6 +290,7 @@ class TestForwardArtifactsToWebhook:
         "already_cued_spoken",
         [
             "I sent the link to Discord for you.",
+            "Sending the link to Discord for you.",
             "I already sent that over to Discord.",
             "Check Discord for the full link.",
             "I posted the link in Discord.",
@@ -321,7 +327,7 @@ class TestForwardArtifactsToWebhook:
         )
 
         assert sent is True
-        assert res_spoken == "I sent the link to Discord."
+        assert res_spoken == "Sending the link to Discord."
 
     def test_adds_period_to_spoken_reply_if_missing(self):
         raw = "Here is the site https://example.com"
@@ -337,7 +343,7 @@ class TestForwardArtifactsToWebhook:
         )
 
         assert sent is True
-        assert res_spoken == "Here is the site. I sent the link to Discord."
+        assert res_spoken == "Here is the site. Sending the link to Discord."
 
     def test_poster_failure_returns_false_and_unmodified_spoken(self):
         raw = "https://example.com"
@@ -407,7 +413,7 @@ class TestForwardArtifactsToWebhook:
             )
 
             assert sent is True
-            assert res_spoken == "Look at the website. I sent the link to Discord."
+            assert res_spoken == "Look at the website. Sending the link to Discord."
             assert len(received_requests) == 1
             assert received_requests[0]["payload"]["content"] == raw
             assert "application/json" in received_requests[0]["content_type"]
@@ -836,7 +842,7 @@ class TestGatewayIntegration:
             log_entry = json.loads(log_path.read_text(encoding="utf-8").strip())
             assert log_entry["endpoint"] == "/ask"
             assert log_entry["node_id"] == "desk"
-            assert "I sent the link to Discord." in log_entry["reply"]
+            assert "Sending the link to Discord." in log_entry["reply"]
         finally:
             srv.shutdown()
             srv.server_close()
@@ -1036,7 +1042,7 @@ class TestAsyncWorkerQueue:
         )
 
         assert sent is True
-        assert res_spoken == "See the repo. I sent the link to Discord."
+        assert res_spoken == "See the repo. Sending the link to Discord."
         assert flush_side_channel_queue(2.0) is True
         mock_poster.assert_called_once()
 
@@ -1058,7 +1064,7 @@ class TestAsyncWorkerQueue:
             http_poster=mock_poster,
         )
         assert sent is True
-        assert "I sent the link to Discord." in res_spoken
+        assert "Sending the link to Discord." in res_spoken
         mock_poster.assert_called_once()
 
         mock_sink = MagicMock(return_value=True)
@@ -1068,3 +1074,94 @@ class TestAsyncWorkerQueue:
             http_poster=mock_sink,
         ) is True
         mock_sink.assert_called_once()
+
+    def test_worker_loop_logs_exceptions(self, caplog):
+        caplog.set_level(logging.ERROR)
+
+        def failing_task():
+            raise RuntimeError("Deliberate background worker task failure")
+
+        assert _enqueue_task(failing_task) is True
+        assert flush_side_channel_queue(2.0) is True
+
+        assert "Deliberate background worker task failure" in caplog.text
+        assert "SideChannelWebhookWorker" in caplog.text or "Error in" in caplog.text
+
+    def test_enqueue_task_logs_dropped_tasks_when_queue_is_full(self, caplog):
+        caplog.set_level(logging.ERROR)
+        small_q = queue.Queue(maxsize=1)
+        small_q.put_nowait(("dummy", (), {}))
+
+        def dummy_task():
+            pass
+
+        enqueued = _enqueue_task(dummy_task, task_queue=small_q)
+        assert enqueued is False
+        assert "queue full" in caplog.text.lower()
+        assert "dropped task" in caplog.text.lower()
+
+    def test_slow_webhook_does_not_delay_transcript_emission(self, tmp_path):
+        webhook_running = threading.Event()
+        webhook_release = threading.Event()
+
+        def slow_poster(*args, **kwargs):
+            webhook_running.set()
+            webhook_release.wait(timeout=3.0)
+            return True
+
+        # Enqueue slow webhook task
+        res_spoken, sent = forward_artifacts_to_webhook(
+            raw_reply="See https://example.com/slow",
+            spoken_reply="See link",
+            webhook_url=DOC_WEBHOOK_URL,
+            http_poster=slow_poster,
+            sync=False,
+        )
+        assert sent is True
+        assert webhook_running.wait(timeout=2.0) is True
+
+        # While webhook worker is blocked, emit turn transcript to local file
+        log_file = tmp_path / "independent_transcript.jsonl"
+        record = {"turn_id": "fast-transcript", "text": "Instant"}
+        assert emit_turn_transcript(record, log_path=str(log_file), sync=False) is True
+
+        # Transcript worker must process the task independently without waiting for webhook
+        t0 = time.time()
+        written = False
+        while time.time() - t0 < 1.0:
+            if log_file.exists() and log_file.stat().st_size > 0:
+                written = True
+                break
+            time.sleep(0.01)
+
+        assert written is True, "Transcript emission was delayed by stalled webhook worker!"
+        data = json.loads(log_file.read_text(encoding="utf-8").strip())
+        assert data["turn_id"] == "fast-transcript"
+
+        # Release slow webhook and flush both queues
+        webhook_release.set()
+        assert flush_side_channel_queue(2.0) is True
+
+    def test_reset_side_channel_queue_drains_both_queues(self):
+        # Insert raw items directly into queues
+        _webhook_queue.put_nowait(("item1", (), {}))
+        _transcript_queue.put_nowait(("item2", (), {}))
+
+        reset_side_channel_queue()
+
+        assert _webhook_queue.empty() is True
+        assert _transcript_queue.empty() is True
+
+    def test_flush_side_channel_queue_timeout_returns_false(self):
+        block_event = threading.Event()
+
+        def blocking_task():
+            block_event.wait(timeout=2.0)
+
+        assert _enqueue_task(blocking_task) is True
+        # Flushes with a tiny timeout should return False because task is still unfinished
+        assert flush_side_channel_queue(timeout_s=0.05) is False
+
+        # Unblock and flush properly
+        block_event.set()
+        assert flush_side_channel_queue(timeout_s=2.0) is True

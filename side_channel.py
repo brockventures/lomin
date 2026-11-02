@@ -7,7 +7,7 @@ Provides:
 - forward_artifacts_to_webhook(raw_reply: str, spoken_reply: str, webhook_url: str = '',
                                http_poster=None, sync: bool = False) -> tuple[str, bool]:
     Detects URLs or triple-backtick code blocks in raw_reply and posts them to
-    MVG_ARTIFACT_WEBHOOK_URL or webhook_url. Appends 'I sent the link to Discord.'
+    MVG_ARTIFACT_WEBHOOK_URL or webhook_url. Appends 'Sending the link to Discord.'
     to the spoken reply if not already cued.
     Runs asynchronously via a bounded background daemon worker queue by default (sync=False),
     or synchronously when sync=True.
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import os
 import queue
 import re
@@ -38,6 +39,8 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
+logger = logging.getLogger(__name__)
+
 # Regex to detect URLs and code blocks in replies
 _URL_RE = re.compile(r"https?://[^\s)>\]\"'`]+", re.IGNORECASE)
 _CODE_BLOCK_RE = re.compile(r"```[\s\S]*?```")
@@ -45,8 +48,10 @@ _CODE_BLOCK_RE = re.compile(r"```[\s\S]*?```")
 # Spoken cues indicating the user has already been verbally notified
 _SPOKEN_CHAT_CUES = (
     "discord",
+    "sending the link",
     "sent the link",
     "sent it to",
+    "sending it to",
     "sent that over",
     "check discord",
     "posted the link",
@@ -238,69 +243,142 @@ def _append_transcript_log(
         return False
 
 
-# Bounded background worker queue
+# Bounded background worker queues (split webhook and transcript queues)
 _QUEUE_MAXSIZE = int(os.environ.get("MVG_SIDE_CHANNEL_QUEUE_SIZE", "1000"))
-_side_channel_queue: queue.Queue = queue.Queue(maxsize=_QUEUE_MAXSIZE)
+_webhook_queue: queue.Queue = queue.Queue(maxsize=_QUEUE_MAXSIZE)
+_transcript_queue: queue.Queue = queue.Queue(maxsize=_QUEUE_MAXSIZE)
+_side_channel_queue: queue.Queue = _webhook_queue  # Backward-compatible alias
+
+_webhook_worker_started = False
+_transcript_worker_started = False
 _worker_started = False
 _worker_lock = threading.Lock()
 
 
-def _worker_loop() -> None:
+def _worker_loop(
+    task_queue: queue.Queue | None = None,
+    worker_name: str = "SideChannelWorker",
+) -> None:
+    q = task_queue if task_queue is not None else _side_channel_queue
     while True:
-        task = _side_channel_queue.get()
+        task = q.get()
         if task is None:
-            _side_channel_queue.task_done()
+            q.task_done()
             break
         func, args, kwargs = task
         try:
             func(*args, **kwargs)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.exception(
+                "Error in %s executing %s: %s",
+                worker_name,
+                getattr(func, "__name__", str(func)),
+                e,
+            )
         finally:
-            _side_channel_queue.task_done()
+            q.task_done()
 
 
-def _ensure_worker_started() -> None:
-    global _worker_started
+def _ensure_webhook_worker_started() -> None:
+    global _webhook_worker_started, _worker_started
     with _worker_lock:
-        if not _worker_started:
-            t = threading.Thread(target=_worker_loop, daemon=True, name="SideChannelWorker")
+        if not _webhook_worker_started:
+            t = threading.Thread(
+                target=_worker_loop,
+                args=(_webhook_queue, "SideChannelWebhookWorker"),
+                daemon=True,
+                name="SideChannelWebhookWorker",
+            )
             t.start()
+            _webhook_worker_started = True
             _worker_started = True
 
 
-def _enqueue_task(func: Callable[..., Any], *args: Any, **kwargs: Any) -> bool:
-    _ensure_worker_started()
+def _ensure_transcript_worker_started() -> None:
+    global _transcript_worker_started, _worker_started
+    with _worker_lock:
+        if not _transcript_worker_started:
+            t = threading.Thread(
+                target=_worker_loop,
+                args=(_transcript_queue, "SideChannelTranscriptWorker"),
+                daemon=True,
+                name="SideChannelTranscriptWorker",
+            )
+            t.start()
+            _transcript_worker_started = True
+            _worker_started = True
+
+
+def _ensure_worker_started() -> None:
+    _ensure_webhook_worker_started()
+    _ensure_transcript_worker_started()
+
+
+def _enqueue_task(
+    func: Callable[..., Any],
+    *args: Any,
+    task_queue: queue.Queue | None = None,
+    **kwargs: Any,
+) -> bool:
+    if task_queue is _transcript_queue or (task_queue is None and func is _dispatch_transcript_sync):
+        _ensure_transcript_worker_started()
+        q = _transcript_queue
+        q_name = "transcript"
+    else:
+        _ensure_webhook_worker_started()
+        q = task_queue if task_queue is not None else _side_channel_queue
+        q_name = "webhook"
+
     try:
-        _side_channel_queue.put_nowait((func, args, kwargs))
+        q.put_nowait((func, args, kwargs))
         return True
     except queue.Full:
+        logger.error(
+            "Side-channel %s queue full; dropped task %s",
+            q_name,
+            getattr(func, "__name__", str(func)),
+        )
         return False
 
 
-def flush_side_channel_queue(timeout_s: float = 5.0) -> bool:
-    """Flush pending side-channel tasks within timeout_s."""
-    t_end = time.time() + timeout_s
-    with _side_channel_queue.all_tasks_done:
-        while _side_channel_queue.unfinished_tasks:
+def _flush_single_queue(q: queue.Queue, t_end: float) -> bool:
+    with q.all_tasks_done:
+        while q.unfinished_tasks:
             remaining = t_end - time.time()
             if remaining <= 0:
                 return False
-            _side_channel_queue.all_tasks_done.wait(remaining)
+            q.all_tasks_done.wait(remaining)
     return True
+
+
+def flush_side_channel_queue(timeout_s: float = 5.0) -> bool:
+    """Flush pending side-channel tasks within timeout_s across both queues."""
+    t_end = time.time() + timeout_s
+    ok_wh = _flush_single_queue(_webhook_queue, t_end)
+    if _side_channel_queue is not _webhook_queue:
+        ok_wh = ok_wh and _flush_single_queue(_side_channel_queue, t_end)
+    ok_tr = _flush_single_queue(_transcript_queue, t_end)
+    return ok_wh and ok_tr
 
 
 flush_queue = flush_side_channel_queue  # Convenience alias
 
 
-def reset_side_channel_queue() -> None:
-    """Drain any pending tasks in queue (for test cleanup)."""
-    while not _side_channel_queue.empty():
+def _reset_single_queue(q: queue.Queue) -> None:
+    while not q.empty():
         try:
-            _side_channel_queue.get_nowait()
-            _side_channel_queue.task_done()
+            q.get_nowait()
+            q.task_done()
         except Exception:
             break
+
+
+def reset_side_channel_queue() -> None:
+    """Drain any pending tasks in both queues (for test cleanup)."""
+    _reset_single_queue(_webhook_queue)
+    if _side_channel_queue is not _webhook_queue:
+        _reset_single_queue(_side_channel_queue)
+    _reset_single_queue(_transcript_queue)
 
 
 def _dispatch_artifact_webhook(
@@ -323,7 +401,7 @@ def forward_artifacts_to_webhook(
     """Inspect raw_reply for URLs or code blocks, and forward to webhook when configured.
 
     If artifacts are found and webhook_url (or MVG_ARTIFACT_WEBHOOK_URL) is configured:
-    - Appends 'I sent the link to Discord.' to spoken_reply if not already cued.
+    - Appends 'Sending the link to Discord.' to spoken_reply if not already cued.
     - If sync=True, posts synchronously and returns (updated_spoken, True) on success
       or (spoken_reply, False) on failure.
     - If sync=False (default), enqueues the POST to the background queue and returns
@@ -348,7 +426,7 @@ def forward_artifacts_to_webhook(
     is_cued = any(cue in lower_spoken for cue in _SPOKEN_CHAT_CUES)
 
     if not is_cued:
-        cue = "I sent the link to Discord."
+        cue = "Sending the link to Discord."
         if spoken_text:
             if not spoken_text.endswith((".", "!", "?")):
                 spoken_text += "."
@@ -370,7 +448,9 @@ def forward_artifacts_to_webhook(
             return spoken_reply, False
         return updated_spoken, True
 
-    enqueued = _enqueue_task(_dispatch_artifact_webhook, target_url, payload, http_poster)
+    enqueued = _enqueue_task(
+        _dispatch_artifact_webhook, target_url, payload, http_poster, task_queue=_webhook_queue
+    )
     if not enqueued:
         return spoken_reply, False
     return updated_spoken, True
@@ -458,6 +538,7 @@ def emit_turn_transcript(
         http_poster,
         eff_token,
         max_bytes,
+        task_queue=_transcript_queue,
     )
 
 
