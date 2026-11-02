@@ -1,12 +1,9 @@
 import base64
 import json
-import os
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-
-import pytest
 
 GATEWAY_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(GATEWAY_DIR))
@@ -27,7 +24,7 @@ def test_consume_brain_sse_openai_deltas():
     ]
     reply = gateway.consume_brain_sse_lines(lines, on_partial=partials.append)
     assert reply == "Hello world!"
-    assert partials == ["Hello", "Hello world", "Hello world!"]
+    assert partials == ["Hello", " world", "!"]
 
 
 def test_consume_brain_sse_bytes_and_comments():
@@ -41,7 +38,7 @@ def test_consume_brain_sse_bytes_and_comments():
     ]
     reply = gateway.consume_brain_sse_lines(lines, on_partial=partials.append)
     assert reply == "The answer."
-    assert partials == ["The", "The answer."]
+    assert partials == ["The", " answer."]
 
 
 def test_consume_brain_sse_events_sentence():
@@ -60,8 +57,7 @@ def test_consume_brain_sse_events_sentence():
     assert reply == "First sentence. Second sentence."
     assert partials == [
         "First sentence.",
-        "First sentence. Second sentence.",
-        "First sentence. Second sentence.",
+        " Second sentence.",
     ]
 
 
@@ -79,7 +75,7 @@ def test_consume_brain_sse_events_delta():
     ]
     reply = gateway.consume_brain_sse_lines(lines, on_partial=partials.append)
     assert reply == "Alpha Beta Gamma"
-    assert partials == ["Alpha ", "Alpha Beta ", "Alpha Beta Gamma"]
+    assert partials == ["Alpha ", "Beta ", "Gamma"]
 
 
 def test_consume_brain_sse_sentence_with_reply_key():
@@ -93,7 +89,7 @@ def test_consume_brain_sse_sentence_with_reply_key():
     ]
     reply = gateway.consume_brain_sse_lines(lines, on_partial=partials.append)
     assert reply == "Sentence one. Sentence two."
-    assert partials == ["Sentence one.", "Sentence one. Sentence two."]
+    assert partials == ["Sentence one.", " Sentence two."]
 
 
 def test_consume_brain_sse_standalone_reply_event():
@@ -162,8 +158,7 @@ def test_http_brain_call_stream_sse_ask_stream(monkeypatch):
         assert reply == "Hello there. How can I help?"
         assert partials == [
             "Hello there.",
-            "Hello there. How can I help?",
-            "Hello there. How can I help?",
+            " How can I help?",
         ]
         assert "text/event-stream" in seen_headers[0].get("Accept", "")
     finally:
@@ -198,7 +193,7 @@ def test_http_brain_call_stream_sse_openai_deltas(monkeypatch):
             "test prompt", "sess-openai-1", "node-1", "", None, 5, on_partial=partials.append
         )
         assert reply == "Streamed response."
-        assert partials == ["Streamed ", "Streamed response."]
+        assert partials == ["Streamed ", "response."]
     finally:
         server.stop()
 
@@ -315,3 +310,107 @@ def test_brain_direct_audio_gating(monkeypatch):
         gateway._FRAME_CTX.ctx = None
     finally:
         server.stop()
+
+
+def test_live_ask_stream_incremental_deltas_preserve_sentences(monkeypatch, tmp_path):
+    """Verify a live /ask/stream request with incremental SSE deltas preserves
+    sentence boundaries and does not scramble or re-emit sentences at the end."""
+    import http.client
+
+    class LiveDeltaBrainHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            deltas = [
+                "Hello there. ",
+                "How are you today? ",
+                "Hi again friend. ",
+                "I am fine.",
+            ]
+            for d in deltas:
+                payload = json.dumps({"choices": [{"delta": {"content": d}}]})
+                self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                self.wfile.flush()
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+
+        def log_message(self, *args):
+            pass
+
+    brain_server = MockBrainServer(LiveDeltaBrainHandler)
+    brain_server.start()
+    gw_server = gateway.ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+    gw_thread = threading.Thread(target=gw_server.serve_forever, daemon=True)
+    gw_thread.start()
+    try:
+        monkeypatch.setattr(gateway, "LOG_DIR", tmp_path)
+        monkeypatch.setattr(gateway, "TEXT_SENTENCES", True)
+        monkeypatch.setattr(gateway, "MVG_BRAIN_URL", f"http://127.0.0.1:{brain_server.port}/v1/chat")
+        monkeypatch.setattr(gateway, "HTTP_BRAIN_STREAM", True)
+        monkeypatch.setattr(gateway, "STREAM_BRAIN_CALL", gateway.http_brain_call_stream)
+
+        conn = http.client.HTTPConnection("127.0.0.1", gw_server.server_port, timeout=10)
+        body = json.dumps({"prompt": "hello", "session_id": "s1", "node_id": "node-1"})
+        conn.request("POST", "/ask/stream", body=body, headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        assert resp.status == 200
+        raw = resp.read().decode("utf-8")
+        conn.close()
+
+        sentences = []
+        final_reply = None
+        for block in raw.split("\n\n"):
+            ev = data = None
+            for line in block.splitlines():
+                if line.startswith("event:"):
+                    ev = line.split(":", 1)[1].strip()
+                elif line.startswith("data:"):
+                    data = json.loads(line.split(":", 1)[1].strip())
+            if ev == "sentence" and data:
+                sentences.append(data["text"])
+            elif ev == "reply" and data:
+                final_reply = data["reply"]
+
+        assert sentences == [
+            "Hello there.",
+            "How are you today?",
+            "Hi again friend.",
+            "I am fine.",
+        ]
+        assert final_reply == "Hello there. How are you today? Hi again friend. I am fine."
+    finally:
+        gw_server.shutdown()
+        gw_server.server_close()
+        brain_server.stop()
+
+
+def test_gateway_consume_brain_sse_lines_20k_deltas_and_1mib_cap():
+    """Verify 20,000 2-char deltas pass 40,000 chars total to on_partial,
+    and a 1 MiB reply event is capped to 262,144 characters."""
+    lines_20k = [
+        'data: {"choices": [{"delta": {"content": "ab"}}]}\n'
+        for _ in range(20_000)
+    ]
+    lines_20k.append("data: [DONE]\n")
+    total_partial_chars = 0
+
+    def count_chars(chunk: str):
+        nonlocal total_partial_chars
+        total_partial_chars += len(chunk)
+
+    reply_20k = gateway.consume_brain_sse_lines(lines_20k, on_partial=count_chars)
+    assert len(reply_20k) == 40_000
+    assert total_partial_chars == 40_000
+
+    one_mib = "M" * (1024 * 1024)
+    lines_1mib = [
+        "event: reply\n",
+        f'data: {{"reply": "{one_mib}"}}\n',
+    ]
+    partials_1mib = []
+    reply_1mib = gateway.consume_brain_sse_lines(lines_1mib, on_partial=partials_1mib.append)
+    assert len(reply_1mib) == 262_144
+    assert len(partials_1mib) == 1
+    assert len(partials_1mib[0]) == 262_144
+

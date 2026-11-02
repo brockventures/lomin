@@ -38,7 +38,11 @@ def server():
 def _reset_env_and_state(monkeypatch, tmp_path):
     gateway._ambient_reset_state()
     get_pending_store().clear()
-    get_device_token_verifier().reset_failures()
+    _v = get_device_token_verifier()
+    _v.reset_failures()
+    _v._tokens_str = None
+    _v._max_failures = None
+    _v._lockout_sec = None
     monkeypatch.setattr(gateway, "NODES_PATH", tmp_path / "nodes.json")
     monkeypatch.setattr(gateway, "NODE_TARGETS_PATH", tmp_path / "node-targets.json")
     monkeypatch.setattr(gateway, "WATCH_TOKENS_PATH", tmp_path / "watch-tokens.json")
@@ -262,37 +266,37 @@ def test_endpoint_bearer_auth_all_endpoints(server, monkeypatch):
     status, _ = _request(port, "POST", "/ask/stream", body=ask_stream_body, headers={"Content-Type": "application/json", "Authorization": "Bearer tok_live"})
     assert status == 200
 
-    # 5. POST /stt
+    # 5. POST /stt (now locked out after 5 failures: missing token returns 429, valid token returns 200)
     status, _ = _request(port, "POST", "/stt?node_id=living_room", body=WAV, headers={"Content-Type": "audio/wav"})
-    assert status == 401
+    assert status == 429
     status, _ = _request(port, "POST", "/stt?node_id=living_room", body=WAV, headers={"Content-Type": "audio/wav", "Authorization": "Bearer tok_live"})
     assert status == 200
 
     # 6. POST /embed
     status, _ = _request(port, "POST", "/embed?node_id=living_room", body=WAV, headers={"Content-Type": "audio/wav"})
-    assert status == 401
+    assert status == 429
     status, _ = _request(port, "POST", "/embed?node_id=living_room", body=WAV, headers={"Content-Type": "audio/wav", "Authorization": "Bearer tok_live"})
     assert status == 200
 
     # 7. POST /ambient
     status, _ = _request(port, "POST", "/ambient?node_id=living_room", body=WAV, headers={"Content-Type": "audio/wav"})
-    assert status == 401
+    assert status == 429
     status, _ = _request(port, "POST", "/ambient?node_id=living_room", body=WAV, headers={"Content-Type": "audio/wav", "Authorization": "Bearer tok_live"})
     assert status == 200
 
     # 8. POST /intent
     intent_body = json.dumps({"text": "turn on lights", "node": "living_room"}).encode("utf-8")
     status, _ = _request(port, "POST", "/intent", body=intent_body, headers={"Content-Type": "application/json"})
-    assert status == 401
+    assert status == 429
     status, _ = _request(port, "POST", "/intent", body=intent_body, headers={"Content-Type": "application/json", "Authorization": "Bearer tok_live"})
     # 204 or 200 (intent miss or match)
     assert status in (200, 204)
 
     # 9. POST /voice/turn
     status, _ = _request(port, "POST", "/voice/turn?node_id=living_room", body=WAV, headers={"Content-Type": "audio/wav"})
-    assert status == 401
+    assert status == 429
     status, _ = _request(port, "POST", "/voice/turn?node_id=living_room", body=WAV, headers={"Content-Type": "audio/wav", "Authorization": "Bearer wrong"})
-    assert status == 401
+    assert status == 429
 
 
 def test_endpoint_lockout_returns_429(server, monkeypatch):
@@ -317,11 +321,20 @@ def test_endpoint_lockout_returns_429(server, monkeypatch):
     s, _ = _request(port, "POST", "/ask", body=ask_body, headers=headers_bad)
     assert s == 401
 
-    # Attempt 4: now locked out -> 429 even with valid token
-    s, body = _request(port, "POST", "/ask", body=ask_body, headers=headers_good)
+    # Attempt 4: now locked out -> 429 for bad/missing tokens
+    s, body = _request(port, "POST", "/ask", body=ask_body, headers=headers_bad)
     assert s == 429
     data = json.loads(body.decode("utf-8"))
     assert "locked out" in data.get("error", "").lower() or "too many" in data.get("error", "").lower()
+
+    s, body = _request(port, "POST", "/ask", body=ask_body, headers={"Content-Type": "application/json"})
+    assert s == 429
+    data = json.loads(body.decode("utf-8"))
+    assert "locked out" in data.get("error", "").lower() or "too many" in data.get("error", "").lower()
+
+    # Valid token during lockout -> exempt from lockout, returns 200
+    s, body = _request(port, "POST", "/ask", body=ask_body, headers=headers_good)
+    assert s == 200
 
 
 # ============================================================================

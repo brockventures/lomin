@@ -176,6 +176,37 @@ def test_on_partial_incremental_mode():
     assert deltas == ["Part1 ", "Part2 ", "Part3"]
 
 
+def test_on_partial_incremental_reply_event_emits_only_unseen_suffix():
+    """Verify that in incremental=True mode, an event: reply following sentence/delta
+    events emits only the unseen suffix delta rather than re-emitting the full reply."""
+    lines_same = [
+        "event: sentence\n",
+        'data: {"text": "First."}\n',
+        "\n",
+        "event: sentence\n",
+        'data: {"text": "Second."}\n',
+        "\n",
+        "event: reply\n",
+        'data: {"reply": "First. Second."}\n',
+    ]
+    deltas_same = []
+    reply_same = consume_brain_sse_lines(lines_same, on_partial=deltas_same.append, incremental=True)
+    assert reply_same == "First. Second."
+    assert deltas_same == ["First.", " Second."]
+
+    lines_suffix = [
+        "event: delta\n",
+        'data: {"text": "Hello "}\n',
+        "\n",
+        "event: reply\n",
+        'data: {"reply": "Hello world!"}\n',
+    ]
+    deltas_suffix = []
+    reply_suffix = consume_brain_sse_lines(lines_suffix, on_partial=deltas_suffix.append, incremental=True)
+    assert reply_suffix == "Hello world!"
+    assert deltas_suffix == ["Hello ", "world!"]
+
+
 # ---------------------------------------------------------------------------
 # 3. Regression Tests: Stalled Socket / Stream Read Timeouts & Interrupts
 # ---------------------------------------------------------------------------

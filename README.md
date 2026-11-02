@@ -273,8 +273,8 @@ Every variable below is also listed, commented, in `.env.example`. Secrets have 
 |---|---|---|
 | `POST /stt` | multipart/form-data (part `audio`, `audio.wav`) or raw WAV body → `{"text": "..."}`. Serves a 60s cache hit (by sha256 of the WAV bytes) if `/ambient` already transcribed the same audio and engaged. | `WHISPER_URL` (default `http://<host>:9099/transcribe`) |
 | `POST /ambient` | multipart/form-data (part `audio`, text field `node_id`) or raw WAV body with `?node_id=` → `{"engage": bool, "transcript": str, "score": float, "classifier": "wake-phrase"\|"pregate"\|"laya"\|"laya+jev"\|"laya+haiku"\|"jev"\|"haiku"\|"name-only"\|"none", "ms": {"stt": .., "classify": ..}}` | Whisper (via the existing `transcribe()`), then Laya → Jev → Haiku classification — see "Ambient gate" below |
-| `POST /ask` | JSON `{prompt, session_id, effort, node_id, speaker, speaker_score}` → `text/event-stream` (`status`*, `reply`, `done`) | `the plugin's brain transport`'s `brain_call()`, target `agent` |
-| `POST /ask/stream` | Same JSON request as `/ask` → `text/event-stream` (`status`*, `sentence`*, `reply`, `done`) | `brain_call_stream()` — speaks each sentence as soon as it's complete; see "MANDOS streaming" below |
+| `POST /ask` | JSON `{prompt, session_id, effort, node_id, speaker, speaker_score}` → `text/event-stream` (`status`*, `reply`, `done`). Returns HTTP 400 on invalid JSON. | `the plugin's brain transport`'s `brain_call()`, target `agent` |
+| `POST /ask/stream` | Same JSON request as `/ask` → `text/event-stream` (`status`*, `sentence`*, `reply`, `done`). Returns HTTP 400 on invalid JSON. | `brain_call_stream()` — speaks each sentence as soon as it's complete; see "MANDOS streaming" below |
 | `POST /v1/audio/speech` | OpenAI-compatible JSON `{model, input, voice, response_format}` → **always 24 kHz mono 16-bit WAV bytes** (`response_format` is accepted but ignored for the actual audio — the edge client plays with `aplay -`, which cannot decode mp3). Long inputs are sentence-chunked and synthesized in parallel (`synthesize_chunked`); see "Every audio payload is 24 kHz mono 16-bit WAV" below. | desktop Chatterbox -> desktop Piper -> local Piper |
 | `POST /embed` | raw WAV body → `{"embedding": [...], "model": "..."}`, straight proxy to the desktop's speaker-embedding server | `MVG_DESKTOP_EMBED_URL` — see "Speaker ID" below |
 | `POST /intent` | JSON `{text, speaker, node, turn_id}` -> `204` (no match) or the same `text/event-stream` as `/ask/stream`. LAMMAS, see below. | `lammas.py` |
@@ -547,6 +547,8 @@ consistent with the privacy rule above. `/stt` checks the cache first and
 logs `ok:cache_hit` instead of calling Whisper again on a hit.
 
 ## /ask and the brain
+
+Requests to `/ask` and `/ask/stream` (`/ask*`) require valid JSON in the request body; invalid JSON returns HTTP 400 (`{"error": "invalid JSON body"}` or `{"error": "request body must be a JSON object"}`).
 
 The prompt is wrapped so the answering leg knows it's a spoken turn:
 
@@ -1071,7 +1073,7 @@ When `MVG_HA_ENABLED=1` (or `MVG_HA_FASTPATH=1`), Lomin consults Home Assistant'
 ### Endpoint Bearer Authentication (`MVG_DEVICE_TOKENS`)
 
 When `MVG_DEVICE_TOKENS` is configured, Lomin enforces Bearer token authentication across all API endpoints:
-- **Protected Endpoints:** `/voice/pending` (GET & POST), `/voice/turn`, `/ask`, `/ask/stream`, `/stt`, `/embed`, `/ambient`, and `/intent`.
+- **Protected Endpoints:** `/voice/pending` (GET & POST), `/voice/turn`, `/ask`, `/ask/stream`, `/stt`, `/embed`, `/ambient`, `/intent`, and `/v1/audio/speech`.
 - **Configuration Format:** Comma-separated per-device tokens and optional shared fallback:
   `MVG_DEVICE_TOKENS="node1:tok1,node2:tok2,shared_fallback"`
 - **Lockout & Rate Limiting:**

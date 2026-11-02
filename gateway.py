@@ -3200,6 +3200,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
         segmenter = SentenceSegmenter(early_first=FIRST_CLAUSE_EARLY)
         wake = threading.Event()  # set when a sentence is queued or the brain finishes
         spoken_text = ""  # stripped reply text already fed to the segmenter
+        raw_seen = ""
+        md_pending = ""
+        spoken_tail_space = False
+        seg_tail_space = False
         lock = threading.Lock()
         futures: list[Future] = []
         executor = ThreadPoolExecutor(max_workers=SENTENCE_CHUNK_MAX_WORKERS)
@@ -3453,22 +3457,59 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 log_fallback("stream_sentence_no_audio", tts_engine="stream-skip")
             return True
 
-        def on_partial(full_raw_text: str) -> None:
-            nonlocal spoken_text
-            # Strip only the part whose markdown is settled: an unclosed link
-            # or code span would otherwise collapse later and shift offsets.
-            full_stripped = strip_defer_marker(strip_markdown(stable_markdown_prefix(full_raw_text)) or "")
-            delta = unspoken_delta(full_stripped, spoken_text)
-            if not delta:
+        def on_partial(chunk: str) -> None:
+            nonlocal spoken_text, raw_seen, md_pending, spoken_tail_space, seg_tail_space
+            if not chunk:
                 return
-            if is_silent_sentinel(full_raw_text):
+            if (
+                raw_seen
+                and (len(chunk) > len(raw_seen) or (len(chunk) == len(raw_seen) and " " in chunk))
+                and chunk.startswith(raw_seen)
+            ):
+                raw_delta = chunk[len(raw_seen):]
+                raw_seen = chunk
+            else:
+                raw_delta = chunk
+                raw_seen += chunk
+            if not raw_delta:
+                return
+            work = md_pending + raw_delta if md_pending else raw_delta
+            if len(raw_seen) <= 32 and is_silent_sentinel(raw_seen):
                 # "Pass." would otherwise complete a sentence and be spoken
                 # before the final-reply check can see it is the sentinel.
+                md_pending = work
                 return
-            spoken_text = full_stripped
+            # Strip only the part whose markdown is settled: an unclosed link
+            # or code span would otherwise collapse later and shift offsets.
+            stable = stable_markdown_prefix(work)
+            md_pending = work[len(stable):]
+            if not stable:
+                return
+            has_lead = stable[0].isspace()
+            has_trail = stable[-1].isspace()
+            core = strip_defer_marker(strip_markdown(stable) or "")
+            had_spoken = bool(spoken_text)
+            if not core:
+                if (has_lead or has_trail) and had_spoken:
+                    spoken_tail_space = True
+                    if not seg_tail_space:
+                        seg_tail_space = True
+                        for sentence in segmenter.feed(" "):
+                            _submit(sentence)
+                return
+            need_sep = had_spoken and (spoken_tail_space or has_lead)
+            if need_sep:
+                spoken_text += " " + core
+            else:
+                spoken_text += core
+            spoken_tail_space = has_trail
+            seg_lead = " " if (need_sep and not seg_tail_space) else ""
+            seg_trail = " " if has_trail else ""
+            seg_delta = f"{seg_lead}{core}{seg_trail}"
+            seg_tail_space = has_trail
             if timing["brain_first_text_ms"] is None:
                 timing["brain_first_text_ms"] = _ms_since_start()
-            for sentence in segmenter.feed(delta):
+            for sentence in segmenter.feed(seg_delta):
                 _submit(sentence)
 
         result_box: dict = {}
@@ -3728,11 +3769,25 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         if content_type.startswith("multipart/form-data"):
             parts = parse_multipart_parts(body, content_type)
+            if enable_vision and "burst_images_b64" in parts and isinstance(parts["burst_images_b64"], (bytes, bytearray)):
+                try:
+                    _parsed_burst = json.loads(parts["burst_images_b64"].decode("utf-8", "replace"))
+                    if isinstance(_parsed_burst, list):
+                        parts["burst_images_b64"] = _parsed_burst
+                except Exception:
+                    pass
             if enable_vision:
                 image_bytes, burst_images = extract_vision_payloads(parts)
             wav_bytes = parts.pop("audio", None)
-            fields = {k: v.decode("utf-8", "replace").strip() for k, v in parts.items()}
+            fields = {k: v.decode("utf-8", "replace").strip() if isinstance(v, (bytes, bytearray)) else v for k, v in parts.items()}
             if enable_vision and not image_bytes and not burst_images:
+                if "burst_images_b64" in fields and isinstance(fields["burst_images_b64"], str):
+                    try:
+                        _parsed_burst = json.loads(fields["burst_images_b64"])
+                        if isinstance(_parsed_burst, list):
+                            fields["burst_images_b64"] = _parsed_burst
+                    except Exception:
+                        pass
                 image_bytes, burst_images = extract_vision_payloads(fields)
         elif content_type in ("audio/wav", "application/octet-stream", ""):
             wav_bytes = body
@@ -3791,6 +3846,53 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         elif not is_valid_image_bytes(_pv):
                             _bad_img = True
                             break
+
+            if not _bad_img and enable_vision and content_type.startswith("multipart/form-data"):
+                _b64_val = parts.get("image_b64") or fields.get("image_b64") or (qs.get("image_b64", [None])[0] if qs else None)
+                if _b64_val is not None:
+                    _s = _b64_val.decode("utf-8", "replace").strip() if isinstance(_b64_val, (bytes, bytearray)) else str(_b64_val).strip()
+                    if _s:
+                        if not image_bytes:
+                            _bad_img = True
+                        else:
+                            try:
+                                _dec = base64.b64decode(_s, validate=True)
+                                if not is_valid_image_bytes(_dec):
+                                    _bad_img = True
+                            except Exception:
+                                _bad_img = True
+
+                if not _bad_img:
+                    _burst_b64_val = parts.get("burst_images_b64") or fields.get("burst_images_b64") or (qs.get("burst_images_b64", [None])[0] if qs else None)
+                    if _burst_b64_val is not None:
+                        if isinstance(_burst_b64_val, (list, tuple)):
+                            _items = _burst_b64_val
+                        else:
+                            _s = _burst_b64_val.decode("utf-8", "replace").strip() if isinstance(_burst_b64_val, (bytes, bytearray)) else str(_burst_b64_val).strip()
+                            if _s:
+                                try:
+                                    _parsed = json.loads(_s)
+                                    _items = _parsed if isinstance(_parsed, list) else [_s]
+                                except Exception:
+                                    _items = [_s]
+                            else:
+                                _items = []
+                        if _items:
+                            if not burst_images:
+                                _bad_img = True
+                            else:
+                                for _it in _items:
+                                    _it_s = _it.decode("utf-8", "replace").strip() if isinstance(_it, (bytes, bytearray)) else str(_it).strip()
+                                    try:
+                                        _dec = base64.b64decode(_it_s, validate=True)
+                                        if not is_valid_image_bytes(_dec):
+                                            _bad_img = True
+                                            break
+                                    except Exception:
+                                        _bad_img = True
+                                        break
+                        elif isinstance(_burst_b64_val, (bytes, bytearray, str)) and _burst_b64_val.strip():
+                            _bad_img = True
             if _bad_img:
                 self._send_json(400, {"error": "invalid image format (must be JPEG, PNG, or WEBP)"})
                 log_request("/voice/turn", (time.time() - t0) * 1000, "error:invalid_image", node=node_id)

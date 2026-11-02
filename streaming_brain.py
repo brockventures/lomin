@@ -339,10 +339,12 @@ def consume_brain_sse_lines(
             if is_reply_event or current_event == "reply":
                 if len(chunk) > max_chars:
                     chunk = chunk[:max_chars]
+                prev_acc = accumulated
                 final_reply = chunk[:max_chars] if max_chars else chunk
                 accumulated = chunk
                 current_len = len(chunk)
-                _emit_partial(accumulated, chunk)
+                reply_delta = chunk[len(prev_acc):] if chunk.startswith(prev_acc) else ""
+                _emit_partial(accumulated, reply_delta)
                 continue
 
             # 4. Handle 'sentence' event

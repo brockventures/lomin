@@ -224,9 +224,9 @@ def test_post_intent_device_tokens_and_lockout(server, monkeypatch):
     monkeypatch.setenv("MVG_AUTH_LOCKOUT_SEC", "30")
 
     verifier = get_device_token_verifier()
-    verifier._tokens_str = None
-    verifier._max_failures = 3
-    verifier._lockout_sec = 30.0
+    monkeypatch.setattr(verifier, "_tokens_str", None)
+    monkeypatch.setattr(verifier, "_max_failures", 3)
+    monkeypatch.setattr(verifier, "_lockout_sec", 30.0)
     with verifier._lock:
         verifier._failures.clear()
 
@@ -259,6 +259,11 @@ def test_post_intent_device_tokens_and_lockout(server, monkeypatch):
     assert st == 429
     assert "locked out" in body.lower()
 
-    # Even with correct token, still locked out -> 429
-    st, body = _post("bed", "Bearer bed-token-123")
+    # Missing token during lockout -> 429
+    st, body = _post("bed", None)
     assert st == 429
+    assert "locked out" in body.lower()
+
+    # Valid token during lockout -> exempt from lockout, returns 200
+    st, body = _post("bed", "Bearer bed-token-123")
+    assert st == 200

@@ -203,13 +203,15 @@ def test_vision_payload_validation_burst_types():
     assert extract_vision_payloads({"burst_images_b64": 12345}) == (None, [])
 
     # Filter out non-base64 elements
-    valid1 = base64.b64encode(b"frame-a").decode("ascii")
-    valid2 = base64.b64encode(b"frame-b").decode("ascii")
+    frame_a = b"\xff\xd8\xff\xe0" + b"frame-a"
+    frame_b = b"\xff\xd8\xff\xe0" + b"frame-b"
+    valid1 = base64.b64encode(frame_a).decode("ascii")
+    valid2 = base64.b64encode(frame_b).decode("ascii")
     img, burst = extract_vision_payloads({
         "burst_images_b64": [valid1, "invalid-text", valid2, None, 999]
     })
     assert img is None
-    assert burst == [b"frame-a", b"frame-b"]
+    assert burst == [frame_a, frame_b]
 
 
 def test_dual_env_flag_support(monkeypatch):
@@ -232,3 +234,104 @@ def test_dual_env_flag_support(monkeypatch):
     monkeypatch.setenv("MVG_VISION_ADPCM", "1")
     assert gateway.is_vision_enabled() is True
     assert gateway.is_adpcm_enabled() is True
+
+
+def _build_multipart_payload(parts: dict[str, tuple[str, bytes] | bytes | str]):
+    boundary = "----forge-test-" + "12345678"
+    body = bytearray()
+    for k, v in parts.items():
+        body += f"--{boundary}\r\n".encode()
+        if isinstance(v, tuple):
+            filename, data = v
+            body += f'Content-Disposition: form-data; name="{k}"; filename="{filename}"\r\n'.encode()
+            body += b"Content-Type: application/octet-stream\r\n\r\n"
+            body += data + b"\r\n"
+        elif isinstance(v, (bytes, bytearray)):
+            body += f'Content-Disposition: form-data; name="{k}"\r\n\r\n'.encode()
+            body += v + b"\r\n"
+        else:
+            body += f'Content-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+    body += f"--{boundary}--\r\n".encode()
+    return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+
+def test_voice_turn_multipart_b64_validation_errors(server, monkeypatch):
+    """Multipart requests with invalid base64 or non-image image_b64/burst_images_b64 return 400."""
+    monkeypatch.setenv("MVG_ENABLE_VISION", "1")
+    monkeypatch.setattr(gateway, "ENABLE_VISION", True)
+    monkeypatch.setattr(gateway, "speech_gate", lambda *args, **kw: ("passed", 900.0, 1.0))
+    monkeypatch.setattr(gateway, "transcribe", lambda wav_bytes: "prompt")
+    monkeypatch.setattr(gateway, "identify_speaker", lambda *args, **kw: ("", 0.0))
+    monkeypatch.setattr(gateway, "decide_addressed", lambda *args, **kw: {"score": 0.9, "classifier": "jev", "laya_score": None})
+    monkeypatch.setattr(gateway, "STREAM_BRAIN_CALL", lambda *a, **k: "ok")
+
+    wav_16k = struct.pack("<4sI4s4sIHHIIHH4sI", b"RIFF", 36, b"WAVE", b"fmt ", 16, 1, 1, 16000, 32000, 2, 16, b"data", 0)
+
+    # 1. Invalid base64 in image_b64
+    body, ctype = _build_multipart_payload({
+        "node_id": "test-node",
+        "audio": ("audio.wav", wav_16k),
+        "image_b64": "invalid_base64_???",
+        "tts": "none",
+    })
+    conn = http.client.HTTPConnection("127.0.0.1", server, timeout=5)
+    conn.request("POST", "/voice/turn", body=body, headers={"Content-Type": ctype})
+    resp = conn.getresponse()
+    assert resp.status == 400
+    conn.close()
+
+    # 2. Valid base64 but not a valid image format (not JPEG, PNG, WEBP)
+    non_img_b64 = base64.b64encode(b"this is plain text, not image bytes").decode("ascii")
+    body, ctype = _build_multipart_payload({
+        "node_id": "test-node",
+        "audio": ("audio.wav", wav_16k),
+        "image_b64": non_img_b64,
+        "tts": "none",
+    })
+    conn = http.client.HTTPConnection("127.0.0.1", server, timeout=5)
+    conn.request("POST", "/voice/turn", body=body, headers={"Content-Type": ctype})
+    resp = conn.getresponse()
+    assert resp.status == 400
+    conn.close()
+
+    # 3. Invalid base64 in burst_images_b64 JSON array
+    body, ctype = _build_multipart_payload({
+        "node_id": "test-node",
+        "audio": ("audio.wav", wav_16k),
+        "burst_images_b64": json.dumps(["invalid_base64_!"]),
+        "tts": "none",
+    })
+    conn = http.client.HTTPConnection("127.0.0.1", server, timeout=5)
+    conn.request("POST", "/voice/turn", body=body, headers={"Content-Type": ctype})
+    resp = conn.getresponse()
+    assert resp.status == 400
+    conn.close()
+
+    # 4. Valid base64 in burst_images_b64, but not an image
+    body, ctype = _build_multipart_payload({
+        "node_id": "test-node",
+        "audio": ("audio.wav", wav_16k),
+        "burst_images_b64": json.dumps([non_img_b64]),
+        "tts": "none",
+    })
+    conn = http.client.HTTPConnection("127.0.0.1", server, timeout=5)
+    conn.request("POST", "/voice/turn", body=body, headers={"Content-Type": ctype})
+    resp = conn.getresponse()
+    assert resp.status == 400
+    conn.close()
+
+    # 5. Valid base64 JPEG succeeds
+    valid_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF-TEST-IMAGE"
+    valid_jpeg_b64 = base64.b64encode(valid_jpeg).decode("ascii")
+    body, ctype = _build_multipart_payload({
+        "node_id": "test-node",
+        "audio": ("audio.wav", wav_16k),
+        "image_b64": valid_jpeg_b64,
+        "tts": "none",
+    })
+    conn = http.client.HTTPConnection("127.0.0.1", server, timeout=5)
+    conn.request("POST", "/voice/turn", body=body, headers={"Content-Type": ctype})
+    resp = conn.getresponse()
+    assert resp.status == 200
+    conn.close()
+
