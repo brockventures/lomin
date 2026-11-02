@@ -3860,11 +3860,25 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         if content_type.startswith("multipart/form-data"):
             parts = parse_multipart_parts(body, content_type)
+            if enable_vision and "burst_images_b64" in parts and isinstance(parts["burst_images_b64"], (bytes, bytearray)):
+                try:
+                    _parsed_burst = json.loads(parts["burst_images_b64"].decode("utf-8", "replace"))
+                    if isinstance(_parsed_burst, list):
+                        parts["burst_images_b64"] = _parsed_burst
+                except Exception:
+                    pass
             if enable_vision:
                 image_bytes, burst_images = extract_vision_payloads(parts)
             wav_bytes = parts.pop("audio", None)
-            fields = {k: v.decode("utf-8", "replace").strip() for k, v in parts.items()}
+            fields = {k: v.decode("utf-8", "replace").strip() if isinstance(v, (bytes, bytearray)) else v for k, v in parts.items()}
             if enable_vision and not image_bytes and not burst_images:
+                if "burst_images_b64" in fields and isinstance(fields["burst_images_b64"], str):
+                    try:
+                        _parsed_burst = json.loads(fields["burst_images_b64"])
+                        if isinstance(_parsed_burst, list):
+                            fields["burst_images_b64"] = _parsed_burst
+                    except Exception:
+                        pass
                 image_bytes, burst_images = extract_vision_payloads(fields)
         elif content_type in ("audio/wav", "application/octet-stream", ""):
             wav_bytes = body
@@ -3923,6 +3937,53 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         elif not is_valid_image_bytes(_pv):
                             _bad_img = True
                             break
+
+            if not _bad_img and enable_vision and content_type.startswith("multipart/form-data"):
+                _b64_val = parts.get("image_b64") or fields.get("image_b64") or (qs.get("image_b64", [None])[0] if qs else None)
+                if _b64_val is not None:
+                    _s = _b64_val.decode("utf-8", "replace").strip() if isinstance(_b64_val, (bytes, bytearray)) else str(_b64_val).strip()
+                    if _s:
+                        if not image_bytes:
+                            _bad_img = True
+                        else:
+                            try:
+                                _dec = base64.b64decode(_s, validate=True)
+                                if not is_valid_image_bytes(_dec):
+                                    _bad_img = True
+                            except Exception:
+                                _bad_img = True
+
+                if not _bad_img:
+                    _burst_b64_val = parts.get("burst_images_b64") or fields.get("burst_images_b64") or (qs.get("burst_images_b64", [None])[0] if qs else None)
+                    if _burst_b64_val is not None:
+                        if isinstance(_burst_b64_val, (list, tuple)):
+                            _items = _burst_b64_val
+                        else:
+                            _s = _burst_b64_val.decode("utf-8", "replace").strip() if isinstance(_burst_b64_val, (bytes, bytearray)) else str(_burst_b64_val).strip()
+                            if _s:
+                                try:
+                                    _parsed = json.loads(_s)
+                                    _items = _parsed if isinstance(_parsed, list) else [_s]
+                                except Exception:
+                                    _items = [_s]
+                            else:
+                                _items = []
+                        if _items:
+                            if not burst_images:
+                                _bad_img = True
+                            else:
+                                for _it in _items:
+                                    _it_s = _it.decode("utf-8", "replace").strip() if isinstance(_it, (bytes, bytearray)) else str(_it).strip()
+                                    try:
+                                        _dec = base64.b64decode(_it_s, validate=True)
+                                        if not is_valid_image_bytes(_dec):
+                                            _bad_img = True
+                                            break
+                                    except Exception:
+                                        _bad_img = True
+                                        break
+                        elif isinstance(_burst_b64_val, (bytes, bytearray, str)) and _burst_b64_val.strip():
+                            _bad_img = True
             if _bad_img:
                 self._send_json(400, {"error": "invalid image format (must be JPEG, PNG, or WEBP)"})
                 log_request("/voice/turn", (time.time() - t0) * 1000, "error:invalid_image", node=node_id)
