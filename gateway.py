@@ -3906,10 +3906,27 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if enable_vision and not image_bytes and not burst_images and qs:
             image_bytes, burst_images = extract_vision_payloads({k: v[0] for k, v in qs.items() if v})
 
-        if enable_vision and image_bytes and not is_valid_image_bytes(image_bytes):
-            self._send_json(400, {"error": "invalid image format (must be JPEG, PNG, or WEBP)"})
-            log_request("/voice/turn", (time.time() - t0) * 1000, "error:invalid_image", node=node_id)
-            return
+        if enable_vision:
+            _bad_img = False
+            if image_bytes and not is_valid_image_bytes(image_bytes):
+                _bad_img = True
+            elif burst_images and any(not is_valid_image_bytes(b) for b in burst_images):
+                _bad_img = True
+            elif content_type.startswith("multipart/form-data"):
+                for _k in ("image", "image_0", "image_1", "image_2", "image_3", "image_4", "burst_images"):
+                    if _k in parts and parts[_k]:
+                        _pv = parts[_k]
+                        if isinstance(_pv, (list, tuple)):
+                            if any(not is_valid_image_bytes(x) for x in _pv if x):
+                                _bad_img = True
+                                break
+                        elif not is_valid_image_bytes(_pv):
+                            _bad_img = True
+                            break
+            if _bad_img:
+                self._send_json(400, {"error": "invalid image format (must be JPEG, PNG, or WEBP)"})
+                log_request("/voice/turn", (time.time() - t0) * 1000, "error:invalid_image", node=node_id)
+                return
 
         image_b64 = base64.b64encode(image_bytes).decode("ascii") if image_bytes else None
         burst_images_b64 = [base64.b64encode(b).decode("ascii") for b in burst_images] if burst_images else []
