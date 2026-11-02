@@ -143,7 +143,7 @@ def test_no_quadratic_concatenation_scaling():
 
     assert len(reply) == delta_count
     assert reply == "t" * delta_count
-    assert partials_count == delta_count
+    assert partials_count == 1
     # 2000 deltas should parse in well under 0.25 seconds in linear time
     assert elapsed < 0.25, f"Took {elapsed:.3f}s; possible quadratic join overhead"
 
@@ -159,7 +159,7 @@ def test_on_partial_accumulated_matches_expected():
     reply = consume_brain_sse_lines(lines, on_partial=partials.append)
 
     assert reply == "Hello world!"
-    assert partials == ["Hello", "Hello world", "Hello world!"]
+    assert partials == ["Hello world!"]
 
 
 def test_on_partial_incremental_mode():
@@ -409,7 +409,7 @@ def test_http_brain_call_stream_integration():
             on_partial=partials.append,
         )
         assert reply == "Streamed via HTTP"
-        assert partials == ["Streamed ", "Streamed via HTTP"]
+        assert partials == ["Streamed via HTTP"]
     finally:
         server.stop()
 
@@ -442,3 +442,32 @@ def test_http_brain_call_stream_json_fallback_capped():
         assert reply == "J" * 50
     finally:
         server.stop()
+
+
+def test_cumulative_on_partial_sentence_boundary_call_counts():
+    # 1. Punctuation-free stream (20k tiny deltas): called only once at the end
+    no_punct_lines = ['data: {"delta": "ab"}\n' for _ in range(20000)]
+    calls_no_punct = []
+    res1 = consume_brain_sse_lines(no_punct_lines, on_partial=calls_no_punct.append, incremental=False)
+    assert len(res1) == 40000
+    assert len(calls_no_punct) == 1
+    assert calls_no_punct[0] == res1
+
+    # 2. Sentence-heavy stream: 500 sentences, each split across 4 deltas (3 words + 1 period delta)
+    sentence_lines = []
+    for _ in range(500):
+        sentence_lines.append('data: {"delta": "Hello "}\n')
+        sentence_lines.append('data: {"delta": "there "}\n')
+        sentence_lines.append('data: {"delta": "friend"}\n')
+        sentence_lines.append('data: {"delta": ". "}\n')
+    calls_sentences = []
+    res2 = consume_brain_sse_lines(sentence_lines, on_partial=calls_sentences.append, incremental=False)
+    assert len(calls_sentences) == 500
+    assert calls_sentences[-1] == res2
+
+    # 3. Sentence-heavy stream with trailing incomplete sentence: 500 sentences + 1 trailing phrase -> 501 calls
+    sentence_lines_tail = list(sentence_lines) + ['data: {"delta": "Trailing words"}\n']
+    calls_tail = []
+    res3 = consume_brain_sse_lines(sentence_lines_tail, on_partial=calls_tail.append, incremental=False)
+    assert len(calls_tail) == 501
+    assert calls_tail[-1] == res3

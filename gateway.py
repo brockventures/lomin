@@ -1952,7 +1952,7 @@ def consume_brain_sse_lines(
     max_stream_seconds: float | None = None,
     max_chars: int | None = None,
     read_timeout: float | None = None,
-    incremental: bool = True,
+    incremental: bool = False,
 ) -> str:
     """Consume Server-Sent Events (SSE) lines from an HTTP brain stream via streaming_brain."""
     eff_max_chars = MAX_SSE_CHARS if max_chars is None else max_chars

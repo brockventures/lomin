@@ -214,19 +214,23 @@ def consume_brain_sse_lines(
     accumulated = ""
     current_len = 0
     final_reply = ""
+    last_emitted_acc: Optional[str] = None
     start_time = time.monotonic()
 
     def _get_accumulated() -> str:
         return (final_reply[:max_chars] if max_chars else final_reply) if final_reply else (accumulated[:max_chars] if max_chars else accumulated)
 
-    def _emit_partial(new_acc: str, delta: str) -> None:
+    def _emit_partial(new_acc: str, delta: str, force_sentence: bool = False) -> None:
+        nonlocal last_emitted_acc
         if on_partial is None:
             return
         if incremental:
             if delta:
                 on_partial(delta)
         else:
-            on_partial(new_acc)
+            if force_sentence or (delta and any(ch in delta for ch in (".", "?", "!", chr(10)))):
+                on_partial(new_acc)
+                last_emitted_acc = new_acc
 
     timed_lines = iter_lines_with_timeout(
         lines,
@@ -239,160 +243,164 @@ def consume_brain_sse_lines(
     # Line ceiling: prevent memory blowup on oversized raw SSE lines
     max_line_len = max(max_chars + 4096, MAX_SSE_LINE_CHARS)
 
-    for raw_line in timed_lines:
-        if max_stream_seconds is not None and (time.monotonic() - start_time) > max_stream_seconds:
-            if raise_on_timeout:
-                raise StreamTimeoutError(
-                    f"Stream deadline exceeded ({max_stream_seconds}s)",
-                    partial_text=_get_accumulated(),
-                )
-            break
+    try:
+        for raw_line in timed_lines:
+            if max_stream_seconds is not None and (time.monotonic() - start_time) > max_stream_seconds:
+                if raise_on_timeout:
+                    raise StreamTimeoutError(
+                        f"Stream deadline exceeded ({max_stream_seconds}s)",
+                        partial_text=_get_accumulated(),
+                    )
+                break
 
-        if isinstance(raw_line, (bytes, bytearray)):
-            line = raw_line.decode("utf-8", errors="replace")
-        else:
-            line = str(raw_line)
-
-        # Enforce cap on single oversized SSE lines
-        if len(line) > max_line_len:
-            line = line[:max_line_len]
-
-        line = line.rstrip("\r\n")
-
-        if not line:
-            current_event = ""
-            continue
-
-        if line.startswith(":"):
-            continue
-
-        if line.startswith("event:"):
-            current_event = line[6:].strip()
-            continue
-
-        if line.startswith("data:"):
-            data_str = line[5:].strip()
-            if not data_str or data_str == "[DONE]":
-                continue
-
-            try:
-                payload = json.loads(data_str)
-            except Exception:
-                payload = data_str
-                # If JSON parsing failed but string looks like a JSON reply field, extract inner text safely
-                if isinstance(data_str, str) and '"reply":' in data_str:
-                    m = re.search(r'"reply":\s*"([^"]*)', data_str)
-                    if m:
-                        payload = {"reply": m.group(1)}
-
-            # 1. OpenAI-style choices -> delta -> content
-            if isinstance(payload, dict) and "choices" in payload:
-                choices = payload.get("choices")
-                if isinstance(choices, list) and choices:
-                    c0 = choices[0]
-                    if isinstance(c0, dict):
-                        delta = c0.get("delta")
-                        if isinstance(delta, dict):
-                            content = delta.get("content")
-                            if isinstance(content, str) and content:
-                                if current_len + len(content) > max_chars:
-                                    allowed = max(0, max_chars - current_len)
-                                    if allowed > 0:
-                                        piece = content[:allowed]
-                                        accumulated += piece
-                                        current_len += allowed
-                                        _emit_partial(accumulated, piece)
-                                    break
-                                accumulated += content
-                                current_len += len(content)
-                                _emit_partial(accumulated, content)
-                                continue
-
-            # 2. Extract payload chunk and detect reply event
-            chunk = ""
-            is_reply_event = False
-            if isinstance(payload, dict):
-                if current_event == "reply":
-                    is_reply_event = True
-                    chunk = payload.get("reply") or payload.get("text") or ""
-                elif current_event == "sentence":
-                    chunk = payload.get("text") or payload.get("reply") or ""
-                elif current_event == "delta":
-                    chunk = payload.get("text") or payload.get("delta") or payload.get("reply") or ""
-                else:
-                    if "reply" in payload and not ("text" in payload or "delta" in payload):
-                        is_reply_event = True
-                        chunk = payload["reply"]
-                    elif "text" in payload:
-                        chunk = payload["text"]
-                    elif "delta" in payload:
-                        chunk = payload["delta"]
-                    else:
-                        chunk = payload.get("reply") or ""
-            elif isinstance(payload, str):
-                chunk = payload
-
-            if not isinstance(chunk, str) or not chunk:
-                continue
-
-            # 3. Handle 'reply' event: strictly bound against max_chars
-            if is_reply_event or current_event == "reply":
-                if len(chunk) > max_chars:
-                    chunk = chunk[:max_chars]
-                final_reply = chunk[:max_chars] if max_chars else chunk
-                accumulated = chunk
-                current_len = len(chunk)
-                _emit_partial(accumulated, chunk)
-                continue
-
-            # 4. Handle 'sentence' event
-            if current_event == "sentence":
-                sep = ""
-                if accumulated and not accumulated.endswith((" ", "\n")) and not chunk.startswith(" "):
-                    sep = " "
-                to_add = sep + chunk if sep else chunk
-                if current_len + len(to_add) > max_chars:
-                    allowed = max(0, max_chars - current_len)
-                    if allowed > 0:
-                        piece = to_add[:allowed]
-                        accumulated += piece
-                        current_len += allowed
-                        _emit_partial(accumulated, piece)
-                    break
-                accumulated += to_add
-                current_len += len(to_add)
-                _emit_partial(accumulated, to_add)
-
-            # 5. Handle 'delta' event
-            elif current_event == "delta":
-                to_add = chunk
-                if current_len + len(to_add) > max_chars:
-                    allowed = max(0, max_chars - current_len)
-                    if allowed > 0:
-                        piece = to_add[:allowed]
-                        accumulated += piece
-                        current_len += allowed
-                        _emit_partial(accumulated, piece)
-                    break
-                accumulated += to_add
-                current_len += len(to_add)
-                _emit_partial(accumulated, to_add)
-
-            # 6. Fallback / generic text chunks
+            if isinstance(raw_line, (bytes, bytearray)):
+                line = raw_line.decode("utf-8", errors="replace")
             else:
-                to_add = chunk
-                if current_len + len(to_add) > max_chars:
-                    allowed = max(0, max_chars - current_len)
-                    if allowed > 0:
-                        piece = to_add[:allowed]
-                        accumulated += piece
-                        current_len += allowed
-                        _emit_partial(accumulated, piece)
-                    break
-                accumulated += to_add
-                current_len += len(to_add)
-                _emit_partial(accumulated, to_add)
+                line = str(raw_line)
 
+            # Enforce cap on single oversized SSE lines
+            if len(line) > max_line_len:
+                line = line[:max_line_len]
+
+            line = line.rstrip("\r\n")
+
+            if not line:
+                current_event = ""
+                continue
+
+            if line.startswith(":"):
+                continue
+
+            if line.startswith("event:"):
+                current_event = line[6:].strip()
+                continue
+
+            if line.startswith("data:"):
+                data_str = line[5:].strip()
+                if not data_str or data_str == "[DONE]":
+                    continue
+
+                try:
+                    payload = json.loads(data_str)
+                except Exception:
+                    payload = data_str
+                    # If JSON parsing failed but string looks like a JSON reply field, extract inner text safely
+                    if isinstance(data_str, str) and '"reply":' in data_str:
+                        m = re.search(r'"reply":\s*"([^"]*)', data_str)
+                        if m:
+                            payload = {"reply": m.group(1)}
+
+                # 1. OpenAI-style choices -> delta -> content
+                if isinstance(payload, dict) and "choices" in payload:
+                    choices = payload.get("choices")
+                    if isinstance(choices, list) and choices:
+                        c0 = choices[0]
+                        if isinstance(c0, dict):
+                            delta = c0.get("delta")
+                            if isinstance(delta, dict):
+                                content = delta.get("content")
+                                if isinstance(content, str) and content:
+                                    if current_len + len(content) > max_chars:
+                                        allowed = max(0, max_chars - current_len)
+                                        if allowed > 0:
+                                            piece = content[:allowed]
+                                            accumulated += piece
+                                            current_len += allowed
+                                            _emit_partial(accumulated, piece)
+                                        break
+                                    accumulated += content
+                                    current_len += len(content)
+                                    _emit_partial(accumulated, content)
+                                    continue
+
+                # 2. Extract payload chunk and detect reply event
+                chunk = ""
+                is_reply_event = False
+                if isinstance(payload, dict):
+                    if current_event == "reply":
+                        is_reply_event = True
+                        chunk = payload.get("reply") or payload.get("text") or ""
+                    elif current_event == "sentence":
+                        chunk = payload.get("text") or payload.get("reply") or ""
+                    elif current_event == "delta":
+                        chunk = payload.get("text") or payload.get("delta") or payload.get("reply") or ""
+                    else:
+                        if "reply" in payload and not ("text" in payload or "delta" in payload):
+                            is_reply_event = True
+                            chunk = payload["reply"]
+                        elif "text" in payload:
+                            chunk = payload["text"]
+                        elif "delta" in payload:
+                            chunk = payload["delta"]
+                        else:
+                            chunk = payload.get("reply") or ""
+                elif isinstance(payload, str):
+                    chunk = payload
+
+                if not isinstance(chunk, str) or not chunk:
+                    continue
+
+                # 3. Handle 'reply' event: strictly bound against max_chars
+                if is_reply_event or current_event == "reply":
+                    if len(chunk) > max_chars:
+                        chunk = chunk[:max_chars]
+                    final_reply = chunk[:max_chars] if max_chars else chunk
+                    accumulated = chunk
+                    current_len = len(chunk)
+                    _emit_partial(accumulated, chunk, force_sentence=True)
+                    continue
+
+                # 4. Handle 'sentence' event
+                if current_event == "sentence":
+                    sep = ""
+                    if accumulated and not accumulated.endswith((" ", "\n")) and not chunk.startswith(" "):
+                        sep = " "
+                    to_add = sep + chunk if sep else chunk
+                    if current_len + len(to_add) > max_chars:
+                        allowed = max(0, max_chars - current_len)
+                        if allowed > 0:
+                            piece = to_add[:allowed]
+                            accumulated += piece
+                            current_len += allowed
+                            _emit_partial(accumulated, piece)
+                        break
+                    accumulated += to_add
+                    current_len += len(to_add)
+                    _emit_partial(accumulated, to_add, force_sentence=True)
+
+                # 5. Handle 'delta' event
+                elif current_event == "delta":
+                    to_add = chunk
+                    if current_len + len(to_add) > max_chars:
+                        allowed = max(0, max_chars - current_len)
+                        if allowed > 0:
+                            piece = to_add[:allowed]
+                            accumulated += piece
+                            current_len += allowed
+                            _emit_partial(accumulated, piece)
+                        break
+                    accumulated += to_add
+                    current_len += len(to_add)
+                    _emit_partial(accumulated, to_add)
+
+                # 6. Fallback / generic text chunks
+                else:
+                    to_add = chunk
+                    if current_len + len(to_add) > max_chars:
+                        allowed = max(0, max_chars - current_len)
+                        if allowed > 0:
+                            piece = to_add[:allowed]
+                            accumulated += piece
+                            current_len += allowed
+                            _emit_partial(accumulated, piece)
+                        break
+                    accumulated += to_add
+                    current_len += len(to_add)
+                    _emit_partial(accumulated, to_add)
+    finally:
+        if not incremental and on_partial is not None and accumulated and last_emitted_acc != accumulated:
+            on_partial(accumulated)
+            last_emitted_acc = accumulated
     result = final_reply if final_reply else accumulated
     if len(result) > max_chars:
         result = result[:max_chars]

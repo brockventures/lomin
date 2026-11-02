@@ -27,7 +27,7 @@ def test_consume_brain_sse_openai_deltas():
     ]
     reply = gateway.consume_brain_sse_lines(lines, on_partial=partials.append)
     assert reply == "Hello world!"
-    assert partials == ["Hello", "Hello world", "Hello world!"]
+    assert partials == ["Hello world!"]
 
 
 def test_consume_brain_sse_bytes_and_comments():
@@ -41,7 +41,7 @@ def test_consume_brain_sse_bytes_and_comments():
     ]
     reply = gateway.consume_brain_sse_lines(lines, on_partial=partials.append)
     assert reply == "The answer."
-    assert partials == ["The", "The answer."]
+    assert partials == ["The answer."]
 
 
 def test_consume_brain_sse_events_sentence():
@@ -79,7 +79,7 @@ def test_consume_brain_sse_events_delta():
     ]
     reply = gateway.consume_brain_sse_lines(lines, on_partial=partials.append)
     assert reply == "Alpha Beta Gamma"
-    assert partials == ["Alpha ", "Alpha Beta ", "Alpha Beta Gamma"]
+    assert partials == ["Alpha Beta Gamma"]
 
 
 def test_consume_brain_sse_sentence_with_reply_key():
@@ -198,7 +198,7 @@ def test_http_brain_call_stream_sse_openai_deltas(monkeypatch):
             "test prompt", "sess-openai-1", "node-1", "", None, 5, on_partial=partials.append
         )
         assert reply == "Streamed response."
-        assert partials == ["Streamed ", "Streamed response."]
+        assert partials == ["Streamed response."]
     finally:
         server.stop()
 
