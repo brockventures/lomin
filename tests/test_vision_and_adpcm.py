@@ -211,9 +211,9 @@ def test_extract_vision_payloads_single_image():
 
 
 def test_extract_vision_payloads_burst_frames():
-    f0 = b"frame-0-bytes"
-    f1 = b"frame-1-bytes"
-    f2 = b"frame-2-bytes"
+    f0 = b"\xff\xd8\xff\xe0" + b"frame-0-bytes"
+    f1 = b"\xff\xd8\xff\xe0" + b"frame-1-bytes"
+    f2 = b"\xff\xd8\xff\xe0" + b"frame-2-bytes"
 
     # Numbered fields image_0 .. image_2
     img, burst = extract_vision_payloads({"image_0": f0, "image_1": f1, "image_2": f2})
@@ -233,9 +233,9 @@ def test_extract_vision_payloads_burst_frames():
 
 
 def test_extract_vision_payloads_combined_single_and_burst():
-    main_img = b"main-camera-frame"
-    burst0 = b"burst-frame-0"
-    burst1 = b"burst-frame-1"
+    main_img = b"\xff\xd8\xff\xe0" + b"main-camera-frame"
+    burst0 = b"\xff\xd8\xff\xe0" + b"burst-frame-0"
+    burst1 = b"\xff\xd8\xff\xe0" + b"burst-frame-1"
 
     img, burst = extract_vision_payloads({"image": main_img, "image_0": burst0, "image_1": burst1})
     assert img == main_img
@@ -244,27 +244,26 @@ def test_extract_vision_payloads_combined_single_and_burst():
 
 def test_extract_vision_payloads_validation():
     # Non-base64 text strings must be rejected
-    img, burst = extract_vision_payloads({"image": "not-valid-base64-text!"})
-    assert img is None
-    assert burst == []
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"image": "not-valid-base64-text!"})
 
-    img, burst = extract_vision_payloads({"image_b64": "invalid base64 ???"})
-    assert img is None
-    assert burst == []
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"image_b64": "invalid base64 ???"})
 
     # Oversized base64 string must be rejected
     oversized_str = "A" * (MAX_IMAGE_B64_BYTES + 10)
-    img, burst = extract_vision_payloads({"image_b64": oversized_str})
-    assert img is None
-    assert burst == []
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"image_b64": oversized_str})
 
     # burst_images_b64 must be a list
-    img, burst = extract_vision_payloads({"burst_images_b64": "not-a-list"})
-    assert img is None
-    assert burst == []
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"burst_images_b64": "not-a-list"})
 
     # burst_images_b64 filters out non-string and non-base64 items
-    valid_b64 = base64.b64encode(b"frame1").decode("ascii")
-    img, burst = extract_vision_payloads({"burst_images_b64": [valid_b64, "invalid_b64!", 12345]})
+    valid_b64 = base64.b64encode(b"\xff\xd8\xff\xe0" + b"frame1").decode("ascii")
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"burst_images_b64": [valid_b64, "invalid_b64!", 12345]})
+
+    img, burst = extract_vision_payloads({"burst_images_b64": [valid_b64]})
     assert img is None
-    assert burst == [b"frame1"]
+    assert burst == [b"\xff\xd8\xff\xe0" + b"frame1"]

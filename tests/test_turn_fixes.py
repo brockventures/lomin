@@ -175,41 +175,45 @@ def test_stream_brain_turn_internal_type_error_never_retried():
 
 def test_vision_payload_validation_rejects_non_base64_text():
     """Non-base64 text strings must be rejected and not treated as raw bytes."""
-    # Plain text strings in 'image' or 'image_b64' must return None
-    img, burst = extract_vision_payloads({"image": "not a base64 encoded string!"})
-    assert img is None
-    assert burst == []
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"image": "not a base64 encoded string!"})
 
-    img, burst = extract_vision_payloads({"image_b64": "hello world plain text"})
-    assert img is None
-    assert burst == []
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"image_b64": "hello world plain text"})
 
 
 def test_vision_payload_validation_size_caps():
     """Vision payloads exceeding 5MB must be rejected."""
     oversized = "A" * (MAX_IMAGE_B64_BYTES + 1024)
-    img, burst = extract_vision_payloads({"image_b64": oversized})
-    assert img is None
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"image_b64": oversized})
 
     oversized_bytes = b"\xff\xd8\xff" + b"\x00" * (5 * 1024 * 1024 + 1)
-    img, burst = extract_vision_payloads({"image": oversized_bytes})
-    assert img is None
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"image": oversized_bytes})
 
 
 def test_vision_payload_validation_burst_types():
     """burst_images_b64 must be a list of valid base64 strings."""
     # Non-list rejected
-    assert extract_vision_payloads({"burst_images_b64": "single-string"}) == (None, [])
-    assert extract_vision_payloads({"burst_images_b64": 12345}) == (None, [])
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"burst_images_b64": "single-string"})
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({"burst_images_b64": 12345})
 
-    # Filter out non-base64 elements
-    valid1 = base64.b64encode(b"frame-a").decode("ascii")
-    valid2 = base64.b64encode(b"frame-b").decode("ascii")
+    # Invalid elements in list raise ValueError
+    valid1 = base64.b64encode(b"\xff\xd8\xff\xe0" + b"frame-a").decode("ascii")
+    valid2 = base64.b64encode(b"\xff\xd8\xff\xe0" + b"frame-b").decode("ascii")
+    with pytest.raises(ValueError, match="invalid image payload"):
+        extract_vision_payloads({
+            "burst_images_b64": [valid1, "invalid-text", valid2, None, 999]
+        })
+
     img, burst = extract_vision_payloads({
-        "burst_images_b64": [valid1, "invalid-text", valid2, None, 999]
+        "burst_images_b64": [valid1, valid2]
     })
     assert img is None
-    assert burst == [b"frame-a", b"frame-b"]
+    assert burst == [b"\xff\xd8\xff\xe0" + b"frame-a", b"\xff\xd8\xff\xe0" + b"frame-b"]
 
 
 def test_dual_env_flag_support(monkeypatch):
