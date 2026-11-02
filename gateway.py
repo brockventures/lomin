@@ -244,18 +244,66 @@ _try_intent = getattr(_plugin, "try_intent", None) or (lambda text: None)
 _NO_INTENT = {"hit": False, "intent": None, "match_ms": 0.0, "handler_ms": None, "reason": "miss"}
 
 
-def _intent(text: str, has_images: bool = False) -> dict:
+def _is_ha_authorized(
+    auth_header: str | None = None,
+    node_id: str = "",
+    speaker: str = "",
+    speaker_score: Any = None,
+    voice_id: dict | None = None,
+    claimed_speaker: str = "",
+) -> bool:
+    """Verify whether caller is authorized to execute Home Assistant control."""
+    ha_intent_token = os.environ.get("MVG_HA_INTENT_TOKEN", "").strip()
+    device_verifier = get_device_token_verifier()
+    tokens_configured = bool(ha_intent_token) or device_verifier.is_enabled
+    if not tokens_configured:
+        return True
+
+    # 1. Check verified speaker identity
+    if claimed_speaker:
+        return True
+    if isinstance(voice_id, dict) and voice_id.get("status") == "verified":
+        return True
+    if speaker:
+        return True
+
+    # 2. Check bearer token in Authorization header
+    if auth_header:
+        token = BearerTokenVerifier._extract_token(auth_header)
+        if token:
+            if ha_intent_token and hmac.compare_digest(token, ha_intent_token):
+                return True
+            if device_verifier.is_enabled and device_verifier.verify(auth_header, node_id):
+                return True
+
+    return False
+
+
+def _intent(
+    text: str,
+    has_images: bool = False,
+    *,
+    ha_authorized: bool = True,
+) -> dict:
     """The fast path's result in the shape the call sites read. A plugin that
-    answers None, or raises, is a miss: the turn goes to the brain."""
+    answers None, or raises, or returns {'hit': False}, is a miss: Home Assistant
+    fast-path is consulted before falling through to the brain."""
     try:
         res = _try_intent(text)
     except Exception as exc:  # a broken plugin must never lose a turn
         return {**_NO_INTENT, "reason": f"intent_error:{type(exc).__name__}"}
-    if res is not None:
+
+    plugin_miss = isinstance(res, dict) and res.get("hit") is False
+    if res is not None and not plugin_miss:
         return res
 
-    ha_enabled = bool(HA_ENABLED) or (os.environ.get("MVG_HA_ENABLED", "0") == "1")
+    ha_enabled = bool(HA_ENABLED) or (
+        os.environ.get("MVG_HA_ENABLED", "0") == "1"
+        or os.environ.get("MVG_HA_FASTPATH", "0") == "1"
+    )
     if ha_enabled:
+        if not ha_authorized:
+            return {**_NO_INTENT, "reason": "ha_unauthorized"}
         t0 = time.time()
         try:
             matched, speech, meta = try_ha_conversation(text, has_images=has_images)
@@ -283,6 +331,8 @@ def _intent(text: str, has_images: bool = False) -> dict:
                 "reason": f"ha_error:{type(exc).__name__}",
             }
 
+    if res is not None:
+        return res
     return dict(_NO_INTENT)
 
 # --- Paths -------------------------------------------------------------
@@ -404,9 +454,13 @@ def validate_multimodal_payload(req: dict) -> tuple[int | None, str | None]:
     return None, None
 
 # Home Assistant conversation intent fast-path flags (Chunk 3 parity)
-HA_ENABLED = os.environ.get("MVG_HA_ENABLED", "0") == "1"
+HA_ENABLED = (
+    os.environ.get("MVG_HA_ENABLED", "0") == "1"
+    or os.environ.get("MVG_HA_FASTPATH", "0") == "1"
+)
 HA_URL = os.environ.get("MVG_HA_URL", "")
 HA_TOKEN = os.environ.get("MVG_HA_TOKEN", "")
+HA_INTENT_TOKEN = os.environ.get("MVG_HA_INTENT_TOKEN", "")
 
 WHISPER_URL = os.environ.get("WHISPER_URL", "http://127.0.0.1:9099/transcribe")
 WHISPER_HEALTH_URL = os.environ.get(
@@ -3049,8 +3103,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
         node_id = req.get("node") or ""
         speaker = req.get("speaker") or ""
         _set_req_node(node_id)
-        fast = _intent(text)
+        claimed, _ = self._trusted_claimed_speaker()
+        auth_header = self.headers.get("Authorization", "")
+        ha_auth = _is_ha_authorized(
+            auth_header=auth_header,
+            node_id=node_id,
+            speaker=speaker,
+            speaker_score=req.get("speaker_score"),
+            claimed_speaker=claimed,
+        )
+        fast = _intent(text, ha_authorized=ha_auth)
         if not fast["hit"]:
+            if fast.get("reason") == "ha_unauthorized":
+                self._send_json(401, {"error": "unauthorized"})
+                log_request("/intent", (time.time() - t0) * 1000, "error:unauthorized", node=node_id)
+                return
             log_request("/intent", (time.time() - t0) * 1000, "ok:no_match", node=node_id,
                         intent=fast["intent"] or "miss", intent_match_ms=fast["match_ms"],
                         intent_handler_ms=fast["handler_ms"], reason=fast["reason"])
@@ -3417,7 +3484,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 # gate, before the brain. A miss / error / slow handler falls
                 # through to the brain below, unchanged.
                 has_vision = bool(ctx.get("image_b64") or ctx.get("burst_images_b64"))
-                fast = opts.get("intent_result") or _intent(prompt, has_images=has_vision)
+                ha_auth = opts.get("ha_authorized")
+                if ha_auth is None:
+                    auth_header = (
+                        self.headers.get("Authorization", "")
+                        if hasattr(self, "headers") and self.headers
+                        else ""
+                    )
+                    ha_auth = _is_ha_authorized(
+                        auth_header=auth_header,
+                        node_id=node_id,
+                        speaker=speaker,
+                        speaker_score=speaker_score,
+                        voice_id=ctx.get("voice_id"),
+                        claimed_speaker=ctx.get("claimed_speaker", ""),
+                    )
+                fast = opts.get("intent_result") or _intent(
+                    prompt, has_images=has_vision, ha_authorized=ha_auth
+                )
                 intent_rec["intent_match_ms"] = fast["match_ms"]
                 intent_rec["intent_handler_ms"] = fast["handler_ms"]
                 if fast["hit"]:

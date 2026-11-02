@@ -1,3 +1,4 @@
+import http.client
 import json
 import sys
 import threading
@@ -5,11 +6,30 @@ import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+import pytest
+
 GATEWAY_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(GATEWAY_DIR))
 
 import gateway  # noqa: E402
 import ha_fastpath  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _reset_ha_state(monkeypatch):
+    ha_fastpath.reset_circuit_breaker()
+    monkeypatch.delenv("MVG_HA_INTENT_TOKEN", raising=False)
+    monkeypatch.delenv("MVG_DEVICE_TOKENS", raising=False)
+    yield
+    ha_fastpath.reset_circuit_breaker()
+
+
+@pytest.fixture()
+def server():
+    srv = gateway.Server(("127.0.0.1", 0), gateway.GatewayHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield srv.server_address[1]
+    srv.shutdown()
 
 
 class MockHAServer:
@@ -435,3 +455,286 @@ def test_gateway_intent_exception_resilience(monkeypatch):
     res = gateway._intent("turn on lights")
     assert res["hit"] is False
     assert res["reason"] == "ha_error:RuntimeError"
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for Chunk 3 Review Fixes (Amos findings)
+# ---------------------------------------------------------------------------
+
+def test_gateway_intent_plugin_hit_false_fallback_to_ha(monkeypatch):
+    """When a plugin returns {'hit': False}, it is treated as a miss so Home Assistant is consulted."""
+    monkeypatch.setattr(gateway, "HA_ENABLED", True)
+    monkeypatch.setenv("MVG_HA_ENABLED", "1")
+
+    # 1. Plugin answers {'hit': False} -> HA should be consulted and hit
+    monkeypatch.setattr(
+        gateway,
+        "_try_intent",
+        lambda text: {"hit": False, "intent": "plugin_intent", "reason": "plugin_declined"},
+    )
+    monkeypatch.setattr(
+        gateway,
+        "try_ha_conversation",
+        lambda transcript, has_images=False, **kwargs: (
+            True,
+            "Turned on fan.",
+            {"reason": "action_done", "response_type": "action_done"},
+        ),
+    )
+
+    res = gateway._intent("turn on fan")
+    assert res["hit"] is True
+    assert res["intent"] == "ha_conversation"
+    assert res["reply"] == "Turned on fan."
+    assert res["reason"] == "action_done"
+
+    # 2. Plugin answers {'hit': False} with HA disabled -> plugin's miss dictionary is returned
+    monkeypatch.setattr(gateway, "HA_ENABLED", False)
+    monkeypatch.delenv("MVG_HA_ENABLED", raising=False)
+    monkeypatch.delenv("MVG_HA_FASTPATH", raising=False)
+
+    res_disabled = gateway._intent("turn on fan")
+    assert res_disabled["hit"] is False
+    assert res_disabled["reason"] == "plugin_declined"
+
+
+def test_try_ha_conversation_cooldown_circuit_breaker():
+    """When HA times out, circuit breaker opens and short-circuits subsequent calls."""
+    call_count = 0
+
+    def timeout_poster(url, headers, payload, timeout_s=2.5):
+        nonlocal call_count
+        call_count += 1
+        raise TimeoutError("HA timed out")
+
+    # Call 1: times out -> returns network_error, trips circuit
+    matched, speech, meta = ha_fastpath.try_ha_conversation(
+        "turn on lamp",
+        enabled=True,
+        ha_url="http://198.51.100.10:8123",
+        cooldown_s=10.0,
+        http_poster=timeout_poster,
+    )
+    assert matched is False
+    assert meta["reason"] == "network_error"
+    assert "HA timed out" in meta["error"]
+    assert call_count == 1
+
+    # Call 2: in cooldown -> immediate circuit_open without invoking poster
+    matched2, speech2, meta2 = ha_fastpath.try_ha_conversation(
+        "turn on lamp",
+        enabled=True,
+        ha_url="http://198.51.100.10:8123",
+        http_poster=timeout_poster,
+    )
+    assert matched2 is False
+    assert meta2["reason"] == "circuit_open"
+    assert meta2["cooldown_remaining"] > 0
+    assert call_count == 1  # poster was NOT called
+
+    # Reset circuit breaker -> poster is invoked again
+    ha_fastpath.reset_circuit_breaker()
+    matched3, speech3, meta3 = ha_fastpath.try_ha_conversation(
+        "turn on lamp",
+        enabled=True,
+        ha_url="http://198.51.100.10:8123",
+        http_poster=timeout_poster,
+    )
+    assert matched3 is False
+    assert meta3["reason"] == "network_error"
+    assert call_count == 2
+
+    # A successful call clears the circuit breaker
+    ha_fastpath.reset_circuit_breaker()
+
+    def success_poster(url, headers, payload, timeout_s=2.5):
+        return {
+            "response": {
+                "speech": {"plain": {"speech": "All clear."}},
+                "response_type": "action_done",
+                "data": {},
+            }
+        }
+
+    matched4, speech4, meta4 = ha_fastpath.try_ha_conversation(
+        "status check",
+        enabled=True,
+        ha_url="http://198.51.100.10:8123",
+        http_poster=success_poster,
+    )
+    assert matched4 is True
+    assert speech4 == "All clear."
+    # Circuit should be closed
+    assert ha_fastpath._circuit_open_until == 0.0
+
+
+def test_try_ha_conversation_inspect_signature():
+    """Poster signatures are checked upfront without relying on TypeError retries."""
+    # 3-arg poster: signature (url, headers, payload)
+    called_3arg = []
+
+    def poster_3arg(url, headers, payload):
+        called_3arg.append((url, headers, payload))
+        return {
+            "response": {
+                "speech": {"plain": {"speech": "3-arg success"}},
+                "response_type": "action_done",
+                "data": {},
+            }
+        }
+
+    matched, speech, meta = ha_fastpath.try_ha_conversation(
+        "test 3-arg",
+        enabled=True,
+        ha_url="http://198.51.100.10:8123",
+        http_poster=poster_3arg,
+    )
+    assert matched is True
+    assert speech == "3-arg success"
+    assert len(called_3arg) == 1
+
+    # 4-arg poster: signature (url, headers, payload, timeout_s)
+    called_4arg = []
+
+    def poster_4arg(url, headers, payload, timeout_s):
+        called_4arg.append((url, headers, payload, timeout_s))
+        return {
+            "response": {
+                "speech": {"plain": {"speech": "4-arg success"}},
+                "response_type": "action_done",
+                "data": {},
+            }
+        }
+
+    matched, speech, meta = ha_fastpath.try_ha_conversation(
+        "test 4-arg",
+        enabled=True,
+        ha_url="http://198.51.100.10:8123",
+        timeout_s=4.5,
+        http_poster=poster_4arg,
+    )
+    assert matched is True
+    assert speech == "4-arg success"
+    assert len(called_4arg) == 1
+    assert called_4arg[0][3] == 4.5
+
+    # Poster that internally raises TypeError (e.g. bug inside poster)
+    def broken_poster(url, headers, payload, timeout_s):
+        raise TypeError("internal bug inside poster")
+
+    matched, speech, meta = ha_fastpath.try_ha_conversation(
+        "test broken poster",
+        enabled=True,
+        ha_url="http://198.51.100.10:8123",
+        http_poster=broken_poster,
+    )
+    assert matched is False
+    assert meta["reason"] == "network_error"
+    assert "internal bug inside poster" in meta["error"]
+
+
+def test_try_ha_conversation_mvg_ha_fastpath_env(monkeypatch):
+    """MVG_HA_FASTPATH alias is supported alongside MVG_HA_ENABLED."""
+    monkeypatch.delenv("MVG_HA_ENABLED", raising=False)
+    monkeypatch.setenv("MVG_HA_FASTPATH", "1")
+
+    assert ha_fastpath.is_ha_fastpath_enabled() is True
+
+    def mock_poster(url, headers, payload, timeout_s=2.5):
+        return {
+            "response": {
+                "speech": {"plain": {"speech": "Fastpath alias works"}},
+                "response_type": "action_done",
+                "data": {},
+            }
+        }
+
+    matched, speech, meta = ha_fastpath.try_ha_conversation(
+        "test fastpath alias",
+        ha_url="http://198.51.100.10:8123",
+        http_poster=mock_poster,
+    )
+    assert matched is True
+    assert speech == "Fastpath alias works"
+
+
+def test_post_intent_auth_enforced(server, monkeypatch):
+    """POST /intent requires authorization when MVG_HA_INTENT_TOKEN is configured."""
+    monkeypatch.setattr(gateway, "HA_ENABLED", True)
+    monkeypatch.setenv("MVG_HA_ENABLED", "1")
+    monkeypatch.setenv("MVG_HA_INTENT_TOKEN", "super-secret-ha-token")
+    monkeypatch.setattr(gateway, "_try_intent", lambda text: None)
+
+    ha_invoked = []
+
+    def mock_ha_conv(transcript, has_images=False, **kwargs):
+        ha_invoked.append(transcript)
+        return True, "Turned on bedroom light.", {"reason": "action_done", "response_type": "action_done"}
+
+    monkeypatch.setattr(gateway, "try_ha_conversation", mock_ha_conv)
+
+    port = server
+
+    def _post_intent(body_dict, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", port)
+        body = json.dumps(body_dict).encode("utf-8")
+        req_headers = {
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+        }
+        if headers:
+            req_headers.update(headers)
+        conn.request("POST", "/intent", body=body, headers=req_headers)
+        resp = conn.getresponse()
+        return resp.status, resp.read().decode("utf-8")
+
+    # 1. Unauthenticated request -> 401, HA not called
+    status, body = _post_intent({"text": "turn on bedroom light", "node": "bed_node"})
+    assert status == 401
+    assert "unauthorized" in body
+    assert len(ha_invoked) == 0
+
+    # 2. Invalid Bearer token -> 401, HA not called
+    status, body = _post_intent(
+        {"text": "turn on bedroom light", "node": "bed_node"},
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+    assert status == 401
+    assert "unauthorized" in body
+    assert len(ha_invoked) == 0
+
+    # 3. Valid Bearer token -> 200, HA executed
+    status, body = _post_intent(
+        {"text": "turn on bedroom light", "node": "bed_node"},
+        headers={"Authorization": "Bearer super-secret-ha-token"},
+    )
+    assert status == 200
+    assert "Turned on bedroom light." in body
+    assert len(ha_invoked) == 1
+
+    # 4. Verified speaker provided -> 200, HA executed
+    ha_invoked.clear()
+    status, body = _post_intent(
+        {"text": "turn on bedroom light", "node": "bed_node", "speaker": "alice"},
+    )
+    assert status == 200
+    assert "Turned on bedroom light." in body
+    assert len(ha_invoked) == 1
+
+    # 5. MVG_DEVICE_TOKENS verification
+    monkeypatch.setenv("MVG_DEVICE_TOKENS", "bed_node:dev_tok_123")
+    ha_invoked.clear()
+    status, body = _post_intent(
+        {"text": "turn on bedroom light", "node": "bed_node"},
+        headers={"Authorization": "Bearer dev_tok_123"},
+    )
+    assert status == 200
+    assert len(ha_invoked) == 1
+
+    # 6. Unset tokens -> open / unauthenticated allowed by default
+    monkeypatch.delenv("MVG_HA_INTENT_TOKEN", raising=False)
+    monkeypatch.delenv("MVG_DEVICE_TOKENS", raising=False)
+    ha_invoked.clear()
+    status, body = _post_intent({"text": "turn on bedroom light", "node": "bed_node"})
+    assert status == 200
+    assert len(ha_invoked) == 1
