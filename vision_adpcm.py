@@ -331,6 +331,20 @@ def decode_adpcm_to_wav(data: bytes, sample_rate: int = 16000) -> bytes:
     return _wrap_pcm_in_wav(pcm_bytes, sample_rate=sr)
 
 
+
+def is_valid_image_bytes(data: bytes) -> bool:
+    """Validate image magic bytes for JPEG, PNG, or WEBP."""
+    if not isinstance(data, (bytes, bytearray)) or len(data) < 3:
+        return False
+    if data[:3] == b"\xff\xd8\xff":
+        return True
+    if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        return True
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return True
+    return False
+
+
 def extract_vision_payloads(parts_or_json: dict) -> Tuple[Optional[bytes], list[bytes]]:
     """Extract optional image and burst images from a multipart parts dict or JSON payload.
 
@@ -356,12 +370,12 @@ def extract_vision_payloads(parts_or_json: dict) -> Tuple[Optional[bytes], list[
                     return None
                 try:
                     decoded = base64.b64decode(b, validate=True)
-                    if decoded and len(decoded) <= MAX_IMAGE_BYTES:
+                    if decoded and len(decoded) <= MAX_IMAGE_BYTES and is_valid_image_bytes(decoded):
                         return decoded
                 except Exception:
                     return None
                 return None
-            if len(b) > MAX_IMAGE_BYTES:
+            if len(b) > MAX_IMAGE_BYTES or not is_valid_image_bytes(b):
                 return None
             return b
         if isinstance(val, str):
@@ -370,7 +384,7 @@ def extract_vision_payloads(parts_or_json: dict) -> Tuple[Optional[bytes], list[
                 return None
             try:
                 decoded = base64.b64decode(s, validate=True)
-                if decoded and len(decoded) <= MAX_IMAGE_BYTES:
+                if decoded and len(decoded) <= MAX_IMAGE_BYTES and is_valid_image_bytes(decoded):
                     return decoded
             except Exception:
                 return None
