@@ -1,144 +1,178 @@
-# Lomin Technical Specification: Talker + Thinker Live Architecture & Hybrid Pipeline Integration
+# Lomin Spec: Talker + Thinker Live Architecture
 
-- **Status:** Draft Proposal (Branch: `spec/talker-thinker-live-architecture`)
-- **Author:** Zero
-- **Date:** 2026-11-05 (PT)
-- **Target Repository:** `mcarmody/lomin`
-
----
-
-## 1. Executive Summary & User-Experience Goals
-
-Lomin's existing LAMMEN pipeline (`POST /voice/turn`) excels at discrete push-to-talk (PTT) and utterance-bounded edge turns, with pluggable TTS chains (`chatterbox` -> `piper-desktop` -> `gemini` -> `kokoro` -> `piper`) and lightweight ADPCM framing for constrained devices like Gotchi. However, single-tier voice pipelines face two fundamental UX bottlenecks during interactive engineering and multi-step agent workflows:
-
-1. **The Latency vs. Intelligence Dilemma:** Audio-native models (`gemini-3.8-live`) respond in **< 400 ms** with natural prosody, but degrade sharply when forced to execute complex multi-step code, shell, or repository tools directly. Conversely, frontier reasoning brains (`MVG_PLUGIN` / Claude Opus / `gemini-4-argon`) sit behind **4 to 15 seconds** of dead air (masked only by generic timed gap-fill clips at `1.2 s` / `3.5 s` / `8.0 s`) during which the user cannot converse, steer, or ask for status.
-2. **Rigid Silence Cutoffs & ASR Loss:** Fixed silence-window VAD clips users off mid-sentence when they pause for 1.5–2 seconds to think, and speech-to-text (Whisper) routinely mangles repository names, CLI flags, and domain acronyms before the backing brain ever sees the prompt.
-
-This specification introduces the **Talker + Thinker Architecture** into Lomin in two complementary ways:
-- **Mode A (Full-Duplex Live Stream — `/voice/live`):** A persistent bidirectional WebSocket session fronted by `gemini-3.8-live` as a zero-tool **Talker** concierge that delegates substantive work via `NON_BLOCKING` async tool calls to Lomin's existing **Thinker** (`MVG_PLUGIN` / `streaming_brain.py`), while retaining the option to route output through Lomin's custom cloned TTS (`chatterbox`) or Gemini's 70-voice library (40 Daikon + 30 Constellation voices).
-- **Mode B (Enhanced `/voice/turn` Hybrid Tricks):** Backporting raw 600ms pre-roll WAV splicing, live mid-turn tool progress injection, early multi-request resolution, and verbal confirmation gates into Lomin's existing HTTP `/voice/turn` and `/ask/stream` pipelines so constrained PTT clients (Gotchi) immediately benefit without requiring a continuous open-mic stream.
+- **Status:** Draft, revised after review of PR #12 (2026-11-05)
+- **Target repository:** `mcarmody/lomin`
+- **Rule:** nothing household-specific lives in this repo (`AGENTS.md`, "The rule"). Examples use `nodes.example.json` only.
 
 ---
 
-## 2. Voice Customization Matrix (Preset Catalog vs. Custom Voice Cloning)
+## 1. Summary and goals
 
-Because different nodes and agents in Crab Cavern have distinct vocal identity requirements, the Talker + Thinker architecture supports two output audio modes configurable per node in `nodes.json` (`"voice_mode": "native" | "custom_tts"`):
+Lomin's pipeline (`POST /voice/turn`) is built for discrete, utterance-bounded turns. When the brain is a full agent, replies take seconds, and the user hears silence or canned gap-fill clips (`_maybe_gap_fill`). The user cannot steer, cancel or ask for status during that time.
 
-### 2.1 Mode 1: Native `gemini-3.8-live` Audio (`response_modalities=["AUDIO"]`)
-- **70-Voice Merged Catalog (`TTS_DAIKON_VOICES`):** Combines the **30 Constellation** voices (`Charon`, `Schedar`, `Orus`, `Aoede`, `Puck`, `Fenrir`, `Kore`) with the **40 Daikon** conversational voices (`Arlo`, `Cruz`, `Finn`, `Neno`, `Fola`, `Cleo`, `Gero`, `Lora`, `Olin`, `Tari`).
-  - *Note on Voice Selection:* `Arlo` and `Cruz` provide clean American (Northwest) deep baritone voices; `Schedar` provides an even, composed lower-middle voice; `Neno` uses an American (Inland Southern) profile.
-- **Persona & Cadence Conditioning:** While `gemini-3.8-live` does not accept arbitrary `.wav` zero-shot cloning weights directly on the WebSocket, its vocal pacing, warmth, dryness, and inflection are steered directly via the Talker's `system_instruction` and `SpeechConfig(language_code="en-US")`.
-- **Latency:** **< 400 ms** time-to-first-audio (24 kHz 16-bit mono PCM).
+This spec adds a **Talker + Thinker** split. A fast **Talker** holds the conversation. The existing brain, reached through `MVG_PLUGIN` hooks, is the **Thinker**. The Talker:
 
-### 2.2 Mode 2: Custom Cloned Voice Hybrid (`chatterbox` / `kokoro` / `piper-desktop` over Live Text Stream)
-- For agents that require a custom zero-shot cloned voice (via Lomin's `desktop_tts.py` Chatterbox Turbo tunnel) or local Kokoro/Piper voices:
-  - The `gemini-3.8-live` Talker session is opened with `response_modalities=["TEXT"]` (or text transcript extraction over the Live stream).
-  - The Talker still processes raw 16 kHz user audio natively (preserving prosody turn-taking tokens `👂` and `❌` and `NON_BLOCKING` tool calls), but streams its short text tokens directly through Lomin's `SentenceSegmenter` -> `tts_backends.synthesize()`.
-- **Trade-off:** Adds ~250–450 ms of local TTS synthesis latency, but preserves 100% custom voice cloning while keeping native audio understanding and prosodic turn-taking on the input side.
+- speaks a short, specific acknowledgement while the Thinker works;
+- narrates progress when asked, or at milestones if enabled;
+- accepts corrections and cancel while the Thinker runs;
+- relays approval prompts, under the safety rules in section 6.5.
 
----
+The design goals, in order:
 
-## 3. System Topology: The 4-Component Split
+- **Configurable Talker.** Any backend that meets one small contract can be the Talker. Gemini Live is the first, not the design.
+- **Custom voices keep working.** An agent's cloned or local voice is a first-class mode.
+- **Cheap wins first.** Contextual openers, spoken progress and spoken cancel land in `/voice/turn` with no new transport and no new dependency.
+- **Stdlib core.** The default install stays stdlib-only. Everything else is a guarded optional dependency, as `onnxruntime` already is.
+- **Off by default.** Cloud audio, metered keys and verbal approvals are all opt-in per node.
 
-```
-+-------------------------------------------------------------------------+
-| 1. Edge / Desktop Client (Gotchi ESP32, Desktop Mic, Browser WebSocket) |
-|    - Streams 16 kHz mono PCM (or ADPCM frames) up                       |
-|    - Plays 24 kHz PCM / WAV out with instant queue flush on barge-in    |
-+------------------------------------+------------------------------------+
-                                     |
-                                     v
-+-------------------------------------------------------------------------+
-| 2. Lomin Voice Harness (`live_harness.py` / `gateway.py`)               |
-|    - 600ms pre-roll PCM ring buffer + 3s barge-in splice (`useraudio`)  |
-|    - Pacer & instant interruption flush (`pacer`)                       |
-|    - Silent tool progress injector (`turn_complete=False`)              |
-+-----------------+-------------------------------------+-----------------+
-                  |                                     |
-    (Persistent WebSocket)                  (Async Plugin / HTTP Stream)
-                  v                                     v
-+-----------------------------------+ +-----------------------------------+
-| 3. Talker (`gemini-3.8-live`)     | | 4. Thinker (`MVG_PLUGIN` Brain)   |
-|    - Sub-400ms audio front-end    | |    - Full Amos / Marvin / Zero /  |
-|    - Prosody tokens: `👂` & `❌`   | |      Claude / Antigravity harness |
-|    - Zero direct bash/repo tools  | |    - Receives transcript + raw    |
-|    - Only 4 coordination tools    | |      16 kHz user WAV clips        |
-|      (`behavior="NON_BLOCKING"`)  | |    - Streams `stage` / `status`   |
-+-----------------------------------+ +-----------------------------------+
+## 2. Talker backends
+
+A backend implements `TalkerBackend`. The harness owns the coordination tools (section 4). A backend only turns audio or text into a stream of events.
+
+```python
+class TalkerBackend:
+    capabilities: set[str]        # see below
+    async def open(self, config: dict) -> None: ...
+    async def send_audio(self, pcm16_16k: bytes) -> None: ...
+    async def send_text(self, text: str, *, silent: bool = False) -> None: ...
+    async def send_tool_result(self, call_id: str, result: dict) -> None: ...
+    def events(self) -> AsyncIterator[dict]: ...   # audio, text, tool_call, interrupted, turn_end
+    async def cancel(self) -> None: ...
+    async def close(self) -> None: ...
 ```
 
-### 3.1 Talker Coordination Tool Contract (`behavior="NON_BLOCKING"`)
-The Talker is stripped of all slow domain/file tools so its context window stays tiny and fast. It exposes only four coordination tools to the model:
-1. `call_reasoning_thinker_agent(request: str, target: Optional[str] = None)`:
-   - Dispatches a task or question asynchronously to the Thinker (`_plugin_brain_call_stream` or `streaming_brain.py`) routed via `nodes.json` (`target`).
-   - **Same-Turn Spoken Bridge Rule:** The Talker's system instruction enforces speaking *one brief, context-specific sentence* (*"Let me check the build logs on Mirrormere"*, *"I'll pull up that PR diff"*) in the **exact same turn** it emits `call_reasoning_thinker_agent`, eliminating generic canned gap-fillers.
-2. `cancel_thinker_agent(task_id: Optional[str] = None)`:
-   - Triggered immediately when the user says *"stop"*, *"cancel that"*, or *"never mind"*, aborting the active Thinker stream in **< 50 ms**.
-3. `answer_permission_or_question(decision: str, details: Optional[str] = None)`:
-   - Resolves pending tool approval gates or clarifying questions surfaced by the Thinker verbally (with a hard guardrail blocking verbal approval of destructive shell patterns like `rm -rf` or force-pushes).
-4. `set_progress_updates(enabled: bool)`:
-   - Toggles whether the Talker proactively narrates major milestone transitions during long multi-minute builds.
+Capabilities a backend declares: `audio_in`, `audio_out`, `text_out`, `full_duplex`, `tool_calls`, `silent_context` (accepts context without triggering speech). The harness degrades by capability. A backend without `silent_context` gets progress updates only on request.
 
----
+### 2.1 Backend classes
 
-## 4. The 6 Core Engineering Mechanisms to Port into Lomin
+| Class | Hears raw audio | Speaks | Turn-taking | Example |
+|---|---|---|---|---|
+| Native live | yes | its own voice (`voice_mode: native`) | full duplex | Gemini Live, other realtime speech models |
+| Text-out, audio-aware | yes | Lomin TTS (`voice_mode: custom_tts`) | Lomin VAD | an audio-in, text-out model called per utterance |
+| Text-out, cascaded | no (uses the Whisper transcript) | Lomin TTS (`voice_mode: custom_tts`) | Lomin VAD | a small, fast text model after Whisper |
 
-### Mechanism 1: Prosody-Driven Turn-Taking (`👂` & `❌`) Replacing Multi-Stage Ambient Gates
-- **Problem:** In `/ambient` and `/voice/turn`, a 1.5–2 second pause while thinking triggers end-of-speech prematurely, and open-room filtering requires chaining Silero VAD -> Whisper -> pregate -> Laya -> Jev -> Haiku.
-- **Lomin Integration:**
-  - On `/voice/live`, `gemini-3.8-live` runs with proactive audio enabled and two silent control tokens in its system prompt:
-    - **`👂` (Wait / Incomplete Thought):** If the user's vocal pitch stays flat/rising, a vowel is drawn out, or syntax is unfinished (*"Can you check the... uh..."*), the Talker outputs `👂` with zero audio and waits for the user to finish.
-    - **`❌` (Ignore Ambient / Unaddressed Speech):** If the audio is background chatter, keyboard noise, or directed at someone else in the room, the Talker outputs `❌` and yields silently.
-  - The harness strips `👂` and `❌` before audio/TTS output and logs a compact `live_gate` telemetry event to `logs/lomin.jsonl`.
+The text-out classes are **Mode 2**. They keep every existing custom voice, because the speaking path is unchanged: Talker text goes through `SentenceSegmenter` and `tts_backends.synthesize()`.
 
-### Mechanism 2: 600ms Pre-Roll Ring Buffer & Raw User Audio WAV Splicing (`user_audio_buffer.py`)
-- **Problem:** Whisper routinely turns technical symbols (`MVG_PLUGIN`, `adpcm_codec.py`, `KSH5`) into phonetic soup (*"M V G plug in"*, *"cash 5"*).
-- **Lomin Integration:**
-  - Maintain a rolling 16 kHz PCM ring buffer per active session with a **600 ms pre-roll lead-in (`sos_lead_in_ms = 600`)** prior to VAD speech start, plus a **3.0 s barge-in splice window (`resume_within_ms = 3000`)** that concatenates interrupted utterances when a user barges in to correct themselves.
-  - When dispatching to the Thinker (`brain_call_stream` / `streaming_brain.py`), package the normalized 16 kHz WAV clip(s) alongside the text transcript (`audio_b64` / `voice_clips`) so multimodal Thinkers hear the exact user pronunciation alongside the transcript.
+### 2.2 What each class gains
 
-### Mechanism 3: Silent Mid-Turn Tool Progress Injection (`turn_complete=False`)
-- **Problem:** While the brain is running tools in `/voice/turn`, the voice pipeline is blind until the final text response arrives.
-- **Lomin Integration:**
-  - Lomin's `streaming_brain.py` and `_plugin_brain_call_stream` already emit `status` / `stages_out` callbacks as the brain executes tools.
-  - In `live_harness.py`, each `status` event from the Thinker is formatted as a compact 1-line update (`[task progress] Running pytest tests/test_gateway.py`) and injected into the Live Talker session via `session.send_client_content(turns=[...], turn_complete=False)`.
-  - Because `turn_complete=False` appends context silently without triggering speech, the Talker remains quiet while the Thinker works—until the user asks *"what step is it on?"*, at which point the Talker answers immediately from its live context window without interrupting the Thinker.
+- **Custom voice unchanged:** voice quality, synthesis latency and the TTS chain. First audio is the Talker's first sentence plus first-chunk synthesis, so it will not match native audio.
+- **Gained by the split itself (all classes):** contextual openers, spoken progress, mid-task corrections, spoken cancel, status answers without interrupting the Thinker.
+- **Gained only with an audio-aware backend:** fewer speech-to-text errors on technical terms.
+- **Gained only with a full-duplex backend:** prosody-aware turn-taking and instant barge-in.
 
-### Mechanism 4: Mid-Turn Steering & Early Partial-Handoff Resolution
-- **Problem:** Users frequently think of a constraint two seconds after issuing a command (*"Oh, and only run the unit tests, not integration"*).
-- **Lomin Integration:**
-  - Each `call_reasoning_thinker_agent` invocation receives a monotonically increasing `handoff_id`.
-  - If the user speaks a follow-up while `handoff_id=1` is still running, the Talker acknowledges it in < 400 ms and emits `call_reasoning_thinker_agent` (`handoff_id=2`), which Lomin injects into the active Thinker session as a mid-turn steering update (or queues behind `handoff_id=1`).
-  - When any handoff resolves (`Early: true` for completed sub-questions), the harness returns a `FunctionResponse` matched to that `handoff_id` so the Talker speaks the answer immediately while remaining tasks continue.
+### 2.3 Candidate backends (facts as of 2026-11-05, to be re-checked before building)
 
-### Mechanism 5: Out-of-Band Verbal Approvals with Destructive Guardrails
-- **Problem:** When a CLI or background agent hits a confirmation gate (`[WAITING]` / Decision Card), voice users are forced to look at a screen or Discord channel to click Approve.
-- **Lomin Integration:**
-  - Extend `streaming_brain.py` / `pending_and_auth.py` with a `waiting_approval` event schema (`{prompt_id, summary, command, is_destructive}`).
-  - Non-destructive prompts are injected into the Talker (`[waiting on the user] Approve running migration check?`), allowing the user to approve or reject verbally via `answer_permission_or_question`.
-  - **Hard Safety Invariant:** Commands matching destructive patterns (`rm -rf`, `git push --force`, `DROP TABLE`, system reboot/container stop) set `is_destructive=True` and are blocked from verbal approval at the harness layer, instructing the Talker to require explicit screen/button confirmation.
+Sourced from Google's docs, read 2026-11-05:
 
-### Mechanism 6: Output Pacer & Sub-20ms Barge-In Queue Flush
-- **Problem:** Live models generate 24 kHz audio 3–5x faster than real-time playback; without frame-level pacing and instant buffer truncation, barging in leaves 1–2 seconds of stale audio playing over the user.
-- **Lomin Integration:**
-  - Implement a 20 ms frame pacer in `live_harness.py` that tracks exactly how many milliseconds of audio have been delivered to the client and immediately flushes unplayed frames (`{"event": "clear_audio_buffer", "interrupted": true}`) the instant `server_content.interrupted` or client barge-in VAD triggers.
+- **Gemini Live, `gemini-3.8-live`:** listed as stable, latest update September 2026 ([model page](https://aistudio.google.com/docs/models/gemini-3.8-live)). That page states "Audio is the only supported response modality (`response_modalities=["AUDIO"]`)", with `output_audio_transcription` for a text transcript. A text-only Live session is **not** available.
+- **Audio in, text out:** `gemini-3.8-flash` accepts audio and returns text through the Interactions API (`client.interactions.create(...)`), request and response, not a stream. Inline limit 20 MB per request ([audio docs](https://aistudio.google.com/docs/audio)).
+- **Voices:** 30 prebuilt voices plus an "Extended Voice Library" of "hundreds", not listed on the page ([speech generation](https://aistudio.google.com/docs/speech-generation)). The earlier draft's "70 voices" and the "Daikon" and "Constellation" family names were not found there. The implementation takes the voice name as an opaque string and lists nothing.
+- **Latency:** no first-audio figure is published on the pages read. No latency number appears in this spec until it is measured (section 8).
 
----
+From secondary sources, provisional (confirm on official docs): OpenAI `gpt-realtime` family, Amazon Nova Sonic, xAI Grok Voice, NVIDIA NemotronLabs VoiceChat (open weights, native tool calling, weak argument accuracy in NVIDIA's own benchmark), NVIDIA PersonaPlex-7B (open weights, tool calling only in community forks).
 
-## 5. Wire Protocol & Phased Implementation Plan on `lomin`
+## 3. System topology
 
-To keep `gateway.py` clean and preserve 100% backwards compatibility with existing `/voice/turn`, `/ambient`, and `/stt` callers, the implementation is split into three small, independently testable phases:
+```
+Client (watch, desktop mic, browser)
+   |  16 kHz PCM or ADPCM up; 24 kHz PCM / WAV down; flush on barge-in
+   v
+Lomin harness (gateway.py, optional live_harness.py)
+   |  VAD, session state, coordination tools, progress relay
+   +---- TalkerBackend (configurable)
+   +---- Thinker: MVG_PLUGIN brain_call_stream (existing hook)
+```
 
-### Phase 1: Pre-Roll Audio Splicing & Contextual Ack in `/voice/turn` (`user_audio_buffer.py`)
-- Add `user_audio_buffer.py` with 600 ms pre-roll ring buffering and 3.0 s barge-in splice stitching.
-- Forward stitched raw 16 kHz WAV (`audio_b64`) alongside the Whisper transcript into `streaming_brain.py` and `_plugin_brain_call_stream` by default when `MVG_SPLICE_RAW_AUDIO=1`.
-- Replace static timed vocal openers in `_maybe_gap_fill` with an optional ultra-fast contextual opener or immediate Thinker `status` stage readout.
+The Thinker is whatever the plugin routes to. This repo names no agent.
 
-### Phase 2: Modular Talker + Thinker Live Harness (`live_harness.py`)
-- Add `live_harness.py` implementing the `TalkerThinkerSession` class over `google-genai` (`client.aio.live.connect` on `gemini-3.8-live`, with stdlib/WebSocket fallback for environments without the SDK).
-- Wire the 4 `NON_BLOCKING` coordination tools (`call_reasoning_thinker_agent`, `cancel_thinker_agent`, `answer_permission_or_question`, `set_progress_updates`) directly to Lomin's `_plugin_brain_call_stream` and `streaming_brain.py`.
-- Wire silent `turn_complete=False` progress injection from `stages_out` / `on_partial` callbacks and support both `"voice_mode": "native"` (70-voice Daikon/Constellation catalog) and `"voice_mode": "custom_tts"` (routing Talker text deltas through `SentenceSegmenter` -> `tts_backends.synthesize()`).
+## 4. Coordination tools (harness-owned)
 
-### Phase 3: Gateway Endpoint, Node Profile Config & Test Suite (`gateway.py`, `tests/test_live_harness.py`)
-- Expose `GET/POST /voice/live` (WebSocket upgrade + bidirectional JSON/PCM framing) and per-node config keys in `nodes.json` (`live_model`, `voice_mode`, `live_voice`, `splice_raw_audio`, `progress_updates`).
-- Add deterministic unit and mock-stream tests in `tests/test_live_harness.py` covering `👂`/`❌` prosody filtering, `NON_BLOCKING` handoffs, `turn_complete=False` progress injection, destructive approval blocking, and barge-in queue flushing.
+Four tools, all with simple arguments, because tool-call argument accuracy varies by backend:
+
+1. `call_thinker(request: str)`: start a Thinker task. The Talker speaks one short specific sentence in the same turn ("let me check the build logs"), replacing generic gap-fill.
+2. `cancel_thinker()`: abort the active task.
+3. `answer_prompt(prompt_id: str, decision: "yes" | "no")`: answer a pending approval, under section 6.5.
+4. `set_progress_updates(enabled: bool)`.
+
+Today the brain hook is a one-shot call with a timeout. `cancel_thinker()` needs a brain-side abort, defined in section 5.
+
+## 5. Required hook extensions (PR A)
+
+All optional; a plugin that lacks one behaves as it does today.
+
+- `brain_call_stream(..., audio_clips=None)`: raw 16 kHz WAV clips alongside the transcript. The gateway passes it only if the plugin's signature accepts it.
+- `brain_cancel(task_id)`: abort a running brain call. Without it, cancel stops speech and drops the result but cannot stop the Thinker, and the Talker says so.
+- `stages_out` events get a stable schema: `{"stage": str, "detail": str, "t": float}`.
+- Approval prompts from the Thinker: `{"prompt_id", "summary", "command", "risk"}`. Defined here; wired in section 6.5.
+
+Each hook gets a test that patches the hook, per `AGENTS.md`.
+
+## 6. Mechanisms
+
+### 6.1 Turn-taking and ambient gating
+
+- Default: unchanged. Open-room gating (Silero, Whisper, pregate, classifier) stays local.
+- Full-duplex backends may use control tokens (`👂` wait, `❌` ignore) to replace the Lomin VAD for that node. This sends continuous room audio to the provider, so it is opt-in per node (`live_gate: "backend"`), documented in the README privacy section, and keeps speaker ID and echo filtering active on the live path.
+- The harness strips control tokens before audio or TTS and logs a compact `live_gate` event.
+
+### 6.2 Pre-roll and barge-in splice
+
+- `/voice/turn` receives a finished upload, so the server has no audio before speech start. Pre-roll is a **client capture contract** (recommended lead-in 600 ms, to be tuned) and is documented, not implemented server-side.
+- On `/voice/live`, the harness keeps a rolling PCM ring buffer, and may splice an utterance that the user restarts within a short window (default 3 s, configurable).
+- With `audio_clips` available, the Thinker receives the user's audio alongside the transcript.
+
+### 6.3 Progress and status
+
+- The harness maps `stages_out` events to one-line updates.
+- Backends with `silent_context` receive them silently and answer "what step is it on?" from context.
+- Other backends get the same lines only when the user asks, or at milestones if `set_progress_updates(true)`, rate-limited so the Talker is not talking over itself.
+- Works in `/voice/turn` too: a status readout replaces the timed gap-fill clip when the stage text is available.
+
+### 6.4 Steering
+
+- v1 queues a follow-up behind the running task (`handoff_id` increments). Mid-turn injection into a running Thinker needs a brain API that does not exist; it is out of scope until a plugin supplies one.
+- When a task resolves, the harness returns the result matched to its `handoff_id`.
+
+### 6.5 Verbal approvals (default off)
+
+- A new subsystem, not an extension of `pending_and_auth.py` (which handles pending messages and device auth).
+- **Allowlist, not denylist.** Only prompts the Thinker marks `risk: "low"` may be approved by voice. Any other prompt, or a prompt with no `risk` field, requires an out-of-band confirmation.
+- Each approval binds to a `prompt_id`, and the Talker reads back the summary before the decision counts.
+- Requires speaker verification for the approving utterance, and ignores audio flagged as ambient or echo.
+- A pattern check for destructive commands is a second layer only, never the gate.
+
+### 6.6 Output pacing and barge-in flush
+
+- The harness paces output in fixed frames and tracks how much audio the client has been sent.
+- On interruption the server sends `{"event": "clear_audio_buffer", "interrupted": true}` and stops queued synthesis.
+- The time until playback actually stops depends on the client buffer and the network. The spec states a **client contract** (flush on the event) and makes no server latency guarantee.
+
+## 7. Wire protocol, config and fallback
+
+- `GET /voice/live`: WebSocket upgrade, JSON control frames and binary PCM. The WebSocket layer is a guarded optional dependency; the default install has no `/voice/live`.
+- Per-node keys in `nodes.example.json`: `talker_backend`, `voice_mode` (`native` | `custom_tts`), `live_voice`, `progress_updates`, `live_gate`, `splice_raw_audio`.
+- Auth: the existing per-node bearer tokens (`MVG_DEVICE_TOKENS`) apply to `/voice/live`.
+- Fallback: if the live session or Talker backend fails, the node answers through `/voice/turn`, and the failure is logged.
+- Cost and keys: backends that call a metered API take their key from an env var only. They are off unless a node enables them. The README states that these calls are billed per use.
+
+## 8. Phased plan
+
+Prerequisite: record a baseline of response times (first audio, total) from `voice-latency.jsonl`, so every later claim is measured. Do not publish latency targets before that.
+
+- **PR A, hooks:** section 5 hook extensions, with tests. No new endpoint.
+- **PR B, `/voice/turn` improvements:** contextual openers and status readouts from `stages_out`, spoken cancel with `brain_cancel`, client pre-roll contract in the docs. No new transport or dependency.
+- **PR C, `TalkerBackend` and `/voice/live`:** the contract, the harness, the WebSocket endpoint as an optional module, and a first backend (Gemini Live for `native`, an audio-in text-out backend for `custom_tts`). Tests use a mock backend.
+- **Later:** verbal approvals (6.5), as a separate spec and PR once speaker verification is in place.
+
+## 9. Tests
+
+- Mock `TalkerBackend` driving: control-token filtering, handoff matching, silent progress, cancel with and without `brain_cancel`, fallback to `/voice/turn`.
+- Hook tests patch the hook, per `AGENTS.md`.
+- The household-name grep from the PR checklist runs on every PR.
+- No test needs the network or a key.
+
+## 10. Open questions
+
+- Which WebSocket implementation: stdlib handshake, or an optional `websockets` dependency?
+- Does any audio-in text-out backend stream tokens, or is each call whole-response? (Docs read show request and response only.)
+- Where does speaker verification live for approvals?
