@@ -125,7 +125,7 @@ Each hook gets a test that patches the hook, per `AGENTS.md`.
 - A new subsystem, not an extension of `pending_and_auth.py` (which handles pending messages and device auth).
 - **Allowlist, not denylist.** Only prompts the Thinker marks `risk: "low"` may be approved by voice. Any other prompt, or a prompt with no `risk` field, requires an out-of-band confirmation.
 - Each approval binds to a `prompt_id`, and the Talker reads back the summary before the decision counts.
-- Requires speaker verification for the approving utterance, and ignores audio flagged as ambient or echo.
+- Requires speaker verification for the approving utterance, reusing what exists in `gateway.py` (`identify_speaker`, `_match_speaker`, `enrolled_roster`; embeddings in `desktop_embed.py`). No new verification subsystem. Ignores audio flagged as ambient or echo.
 - A pattern check for destructive commands is a second layer only, never the gate.
 
 ### 6.6 Output pacing and barge-in flush
@@ -179,8 +179,8 @@ Prerequisite: record a baseline of response times (`brain_first_text_ms`, first 
 
 ## 10. Open questions
 
+Resolved (maintainer, via review of PR #12): the WebSocket layer is the optional `websockets` dependency, guarded like `onnxruntime`; approval speaker verification reuses the existing code in `gateway.py`.
+
 - **Product:** is a hybrid acceptable (native Talker for openers and progress, custom voice for the final answer), or must a node pick one voice?
-- Which WebSocket implementation for PR C (the spec proposes optional `websockets`)?
 - Can an audio-in model stream both input and output? Out of scope for now.
-- Where does speaker verification live for approvals?
 - Splice rule for `/voice/live` (6.2): what counts as a restart, and does the Thinker receive one concatenated clip or two? Pin down before PR C.
