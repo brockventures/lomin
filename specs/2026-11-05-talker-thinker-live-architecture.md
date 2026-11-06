@@ -8,30 +8,30 @@
 
 ## 1. Summary and goals
 
-Lomin's pipeline (`POST /voice/turn`) is built for discrete, utterance-bounded turns. When the brain is a full agent, replies take seconds, and the user hears silence or canned gap-fill clips (`_maybe_gap_fill`). The user cannot steer, cancel or ask for status during that time.
+Lomin's pipeline (`POST /voice/turn`) is built for discrete, utterance-bounded turns. When the brain is a full agent, replies take 4-5 s to the first sentence (README, "Gap-fill and latency metrics"), and the user hears canned gap-fill clips. A generated opener from a text model was tried before and dropped as too slow, so gap-fill stays canned. The user cannot steer, cancel or ask for status during that time.
 
-This spec adds a **Talker + Thinker** split. A fast **Talker** holds the conversation. The existing brain, reached through `MVG_PLUGIN` hooks, is the **Thinker**. The Talker:
+This spec adds an **orchestrator** pattern. The speaking agent does no work of its own. It speaks one short, specific sentence, delegates to a **Thinker** (a subagent or the existing brain behind `MVG_PLUGIN`), narrates progress, and takes cancel and follow-ups. The value is in that discipline, and it does not depend on the model. A native live model is the fastest way to run it, not the only way.
 
-- speaks a short, specific acknowledgement while the Thinker works;
-- narrates progress when asked, or at milestones if enabled;
-- accepts corrections and cancel while the Thinker runs;
-- relays approval prompts, under the safety rules in section 6.5.
+There are two modes. A node uses one of them.
 
-The design goals, in order:
+- **Mode 1, native live orchestrator.** A full-duplex audio model (Gemini Live first) is the orchestrator. It is fast and has native turn-taking. It speaks in its own voice, so there is **no custom voice**. Needs `/voice/live` (PR C).
+- **Mode 2, prompted orchestrator on the current pipeline.** Whisper, the classifier, the brain and the TTS chain are unchanged, so custom voices work. The brain is prompted to be an orchestrator: speak one sentence, then delegate to a subagent, choosing the subagent's model and effort for the task. Lomin injects that instruction (section 6.7); the brain does the rest. Needs no new transport and no new dependency (PRs A and B).
 
-- **Configurable Talker.** Any backend that meets one small contract can be the Talker. Gemini Live is the first, not the design.
-- **Custom voices keep working.** An agent's cloned or local voice is a first-class mode.
-- **Cheap wins first.** Contextual openers, spoken progress and spoken cancel land in `/voice/turn` with no new transport and no new dependency.
-- **Stdlib core.** The default install stays stdlib-only. Everything else is a guarded optional dependency, as `onnxruntime` already is.
-- **Off by default.** Cloud audio, metered keys and verbal approvals are all opt-in per node.
+Goals, in order:
 
-## 2. Talker backends
+- **Cheap wins first.** Mode 2, narrated progress and spoken cancel land in `/voice/turn`.
+- **Custom voices keep working** wherever Mode 1 is not used.
+- **Measure before claiming.** Every speed claim in this spec is a hypothesis until it is measured against the `voice-latency.jsonl` baseline (section 8).
+- **Stdlib core.** The default install stays stdlib-only. Mode 1 is a guarded optional dependency, as `onnxruntime` already is.
+- **Off by default.** Cloud audio, metered keys, the orchestrator prompt and verbal approvals are all opt-in per node.
 
-A backend implements `TalkerBackend`. The harness owns the coordination tools (section 4). A backend only turns audio or text into a stream of events.
+## 2. Mode 1: Talker backend
+
+The harness owns the coordination tools (section 4). A backend only turns audio into a stream of events. Mode 1 needs a native, audio-out model; text-out classes (a cascaded text model, or audio-in with whole-response text) are dropped because they repeat the slow generated-opener design.
 
 ```python
 class TalkerBackend:
-    capabilities: set[str]        # see below
+    capabilities: set[str]        # audio_in, audio_out, full_duplex, tool_calls, silent_context
     async def open(self, config: dict) -> None: ...
     async def send_audio(self, pcm16_16k: bytes) -> None: ...
     async def send_text(self, text: str, *, silent: bool = False) -> None: ...
@@ -41,33 +41,20 @@ class TalkerBackend:
     async def close(self) -> None: ...
 ```
 
-Capabilities a backend declares: `audio_in`, `audio_out`, `text_out`, `full_duplex`, `tool_calls`, `silent_context` (accepts context without triggering speech). The harness degrades by capability. A backend without `silent_context` gets progress updates only on request.
+A backend without `silent_context` gets progress updates only on request.
 
-### 2.1 Backend classes
+### 2.1 The voice trade-off
 
-| Class | Hears raw audio | Speaks | Turn-taking | Example |
-|---|---|---|---|---|
-| Native live | yes | its own voice (`voice_mode: native`) | full duplex | Gemini Live, other realtime speech models |
-| Text-out, audio-aware | yes | Lomin TTS (`voice_mode: custom_tts`) | Lomin VAD | an audio-in, text-out model called per utterance |
-| Text-out, cascaded | no (uses the Whisper transcript) | Lomin TTS (`voice_mode: custom_tts`) | Lomin VAD | a small, fast text model after Whisper |
+A native Talker speaks in its own voice. A node therefore chooses between the Talker's speed and prosody, or a custom voice, not both in one reply. A possible hybrid is for the Talker to speak openers and progress lines natively and for the custom-voice TTS to speak the Thinker's final answer. Mixed voices in one reply may sound wrong. This is a product decision (section 10), not a design default.
 
-The text-out classes are **Mode 2**. They keep every existing custom voice, because the speaking path is unchanged: Talker text goes through `SentenceSegmenter` and `tts_backends.synthesize()`.
-
-### 2.2 What each class gains
-
-- **Custom voice unchanged:** voice quality, synthesis latency and the TTS chain. First audio is the Talker's first sentence plus first-chunk synthesis, so it will not match native audio.
-- **Gained by the split itself (all classes):** contextual openers, spoken progress, mid-task corrections, spoken cancel, status answers without interrupting the Thinker.
-- **Gained only with an audio-aware backend:** fewer speech-to-text errors on technical terms.
-- **Gained only with a full-duplex backend:** prosody-aware turn-taking and instant barge-in.
-
-### 2.3 Candidate backends (facts as of 2026-11-05, to be re-checked before building)
+### 2.2 Candidate backends (facts as of 2026-11-05, to be re-checked before building)
 
 Sourced from Google's docs, read 2026-11-05:
 
 - **Gemini Live, `gemini-3.8-live`:** listed as stable, latest update September 2026 ([model page](https://aistudio.google.com/docs/models/gemini-3.8-live)). That page states "Audio is the only supported response modality (`response_modalities=["AUDIO"]`)", with `output_audio_transcription` for a text transcript. A text-only Live session is **not** available.
-- **Audio in, text out:** `gemini-3.8-flash` accepts audio and returns text through the Interactions API (`client.interactions.create(...)`), request and response, not a stream. Inline limit 20 MB per request ([audio docs](https://aistudio.google.com/docs/audio)).
 - **Voices:** 30 prebuilt voices plus an "Extended Voice Library" of "hundreds", not listed on the page ([speech generation](https://aistudio.google.com/docs/speech-generation)). The earlier draft's "70 voices" and the "Daikon" and "Constellation" family names were not found there. The implementation takes the voice name as an opaque string and lists nothing.
 - **Latency:** no first-audio figure is published on the pages read. No latency number appears in this spec until it is measured (section 8).
+- **Audio in, text out (`gemini-3.8-flash`, Interactions API):** request and response, not a stream; inline limit 20 MB ([audio docs](https://aistudio.google.com/docs/audio)). Not a Mode 1 candidate. Whether it could gate an open stream is unconfirmed and out of scope for now.
 
 From secondary sources, provisional (confirm on official docs): OpenAI `gpt-realtime` family, Amazon Nova Sonic, xAI Grok Voice, NVIDIA NemotronLabs VoiceChat (open weights, native tool calling, weak argument accuracy in NVIDIA's own benchmark), NVIDIA PersonaPlex-7B (open weights, tool calling only in community forks).
 
@@ -138,7 +125,7 @@ Each hook gets a test that patches the hook, per `AGENTS.md`.
 - A new subsystem, not an extension of `pending_and_auth.py` (which handles pending messages and device auth).
 - **Allowlist, not denylist.** Only prompts the Thinker marks `risk: "low"` may be approved by voice. Any other prompt, or a prompt with no `risk` field, requires an out-of-band confirmation.
 - Each approval binds to a `prompt_id`, and the Talker reads back the summary before the decision counts.
-- Requires speaker verification for the approving utterance, and ignores audio flagged as ambient or echo.
+- Requires speaker verification for the approving utterance, reusing what exists in `gateway.py` (`identify_speaker`, `_match_speaker`, `enrolled_roster`; embeddings in `desktop_embed.py`). No new verification subsystem. Ignores audio flagged as ambient or echo.
 - A pattern check for destructive commands is a second layer only, never the gate.
 
 ### 6.6 Output pacing and barge-in flush
@@ -147,32 +134,53 @@ Each hook gets a test that patches the hook, per `AGENTS.md`.
 - On interruption the server sends `{"event": "clear_audio_buffer", "interrupted": true}` and stops queued synthesis.
 - The time until playback actually stops depends on the client buffer and the network. The spec states a **client contract** (flush on the event) and makes no server latency guarantee.
 
+### 6.7 Orchestrator prompt (Mode 2)
+
+`frame_voice_prompt` already wraps every brain call. When `MVG_ORCHESTRATOR_PROMPT=1`, it appends a short, generic instruction block:
+
+- You are the voice orchestrator. Speak one specific sentence first, then delegate.
+- Do not do the work yourself. Hand it to a subagent and choose that subagent's model and effort for the task.
+- If a follow-up arrives while a task runs, say so. Do not start a second task silently.
+- Progress lines come from the harness. Do not invent progress.
+
+Rules:
+
+- The text names no tool, agent or household. The plugin adds the site-specific half (tool names, model choices) through `MVG_ORCHESTRATOR_TEXT` or a plugin hook.
+- Off by default, switchable per target.
+- A prompt is a request, not a guarantee. Whether it works is decided by the experiment in section 8, and the result goes in the PR.
+- Mid-task steering of a running subagent is brain-side and **out of scope for Lomin**. Lomin offers cancel (`brain_cancel`) and queue-behind only.
+
 ## 7. Wire protocol, config and fallback
 
-- `GET /voice/live`: WebSocket upgrade, JSON control frames and binary PCM. The WebSocket layer is a guarded optional dependency; the default install has no `/voice/live`.
-- Per-node keys in `nodes.example.json`: `talker_backend`, `voice_mode` (`native` | `custom_tts`), `live_voice`, `progress_updates`, `live_gate`, `splice_raw_audio`.
+- Mode 1 only. `GET /voice/live`: WebSocket upgrade, JSON control frames and binary PCM. The WebSocket layer is a guarded optional dependency; the default install has no `/voice/live`.
+- Per-node keys in `nodes.example.json`: `orchestrator_prompt` (Mode 2), `talker_backend`, `live_voice`, `progress_updates`, `live_gate`, `splice_raw_audio`.
 - Auth: the existing per-node bearer tokens (`MVG_DEVICE_TOKENS`) apply to `/voice/live`.
 - Fallback: if the live session or Talker backend fails, the node answers through `/voice/turn`, and the failure is logged.
 - Cost and keys: backends that call a metered API take their key from an env var only. They are off unless a node enables them. The README states that these calls are billed per use.
 
-## 8. Phased plan
+## 8. Phased plan and first experiment
 
-Prerequisite: record a baseline of response times (first audio, total) from `voice-latency.jsonl`, so every later claim is measured. Do not publish latency targets before that.
+Prerequisite: record a baseline of response times (`brain_first_text_ms`, first audio, total) from `voice-latency.jsonl`, so every later claim is measured. Do not publish latency targets before that.
 
-- **PR A, hooks:** section 5 hook extensions, with tests. No new endpoint.
-- **PR B, `/voice/turn` improvements:** contextual openers and status readouts from `stages_out`, spoken cancel with `brain_cancel`, client pre-roll contract in the docs. No new transport or dependency.
-- **PR C, `TalkerBackend` and `/voice/live`:** the contract, the harness, the WebSocket endpoint as an optional module, and a first backend (Gemini Live for `native`, an audio-in text-out backend for `custom_tts`). Tests use a mock backend.
+**Experiment 1 (first, no new transport).** Turn records carry an `orchestrator` field. Run the same node and brain with `MVG_ORCHESTRATOR_PROMPT` off, then on, over the same set of requests. Compare `brain_first_text_ms` and `first_audio_ms`. If the orchestrator prompt does not move `brain_first_text_ms`, Mode 2 only helps through narration, and PR C becomes the real speed work.
+
+- **PR A, hooks:** `audio_clips`, `brain_cancel(task_id)`, the `stages_out` schema, with tests. `task_id` is minted by the gateway per brain call and is the same id as `handoff_id`. The gateway passes `audio_clips` or `task_id` only if the plugin signature accepts it. No new endpoint.
+- **PR B, Mode 2 and `/voice/turn`:** the orchestrator prompt (6.7), `orchestrator` in the latency record, narration of `stages_out`, spoken cancel with `brain_cancel`, client pre-roll contract in the docs. No new transport or dependency.
+- **PR C, Mode 1:** `TalkerBackend`, `/voice/live`, a WebSocket implementation as a guarded optional dependency (optional `websockets` package on its own event loop thread, not a hand-rolled stdlib handshake), and Gemini Live as the first backend. Tests use a mock backend. Decide after Experiment 1 and the baseline.
 - **Later:** verbal approvals (6.5), as a separate spec and PR once speaker verification is in place.
 
 ## 9. Tests
 
-- Mock `TalkerBackend` driving: control-token filtering, handoff matching, silent progress, cancel with and without `brain_cancel`, fallback to `/voice/turn`.
+- Frame tests: the orchestrator block is absent by default, present when enabled, and contains no household names.
+- Mock `TalkerBackend` driving (PR C): control-token filtering, handoff matching, silent progress, cancel with and without `brain_cancel`, fallback to `/voice/turn`. On fallback, an in-flight Thinker task is not dropped: its result is spoken on `/voice/turn` and the client receives a protocol event telling it to switch.
 - Hook tests patch the hook, per `AGENTS.md`.
 - The household-name grep from the PR checklist runs on every PR.
 - No test needs the network or a key.
 
 ## 10. Open questions
 
-- Which WebSocket implementation: stdlib handshake, or an optional `websockets` dependency?
-- Does any audio-in text-out backend stream tokens, or is each call whole-response? (Docs read show request and response only.)
-- Where does speaker verification live for approvals?
+Resolved (maintainer, via review of PR #12): the WebSocket layer is the optional `websockets` dependency, guarded like `onnxruntime`; approval speaker verification reuses the existing code in `gateway.py`.
+
+- **Product:** is a hybrid acceptable (native Talker for openers and progress, custom voice for the final answer), or must a node pick one voice?
+- Can an audio-in model stream both input and output? Out of scope for now.
+- Splice rule for `/voice/live` (6.2): what counts as a restart, and does the Thinker receive one concatenated clip or two? Pin down before PR C.
